@@ -3,7 +3,7 @@
 # Python 3.12 + Node.js 20 + Playwright Chromium + Streamlit
 # ============================================================
 
-FROM python:3.12-slim
+FROM --platform=linux/amd64 python:3.12-slim
 
 # --- System packages ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
