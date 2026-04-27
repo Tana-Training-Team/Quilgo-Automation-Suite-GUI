@@ -1,0 +1,170 @@
+# v2/app/automation/task_manager.py
+
+import threading
+import subprocess
+import configparser
+import sys
+import os
+import json
+import pandas as pd
+from .. import config
+from ..utils import TextRedirector
+from core import processor
+from core.processing.quilgo_parser import INTERNAL_TO_QUILGO_SIDEBAR_NAME
+from core.processing.file_helpers import rotate_master_to_backup, write_manifest
+
+class TaskManager:
+    """Handles all backend automation tasks."""
+    def __init__(self, view):
+        self.view = view
+        self.stop_requested = threading.Event()
+        self.stop_and_continue_requested = threading.Event()  # soft stop → hand off to Part 2
+        self.automation_process = None
+        self.review_event = threading.Event()
+        self.review_decision = None
+        self.final_results = [] # Persists until a new run starts
+
+        # Filter state — set by the GUI before starting a run
+        self.selected_quizzes: list = []   # Empty = download/process all
+        self.start_date = None             # pd.Timestamp or None
+        self.end_date = None               # pd.Timestamp or None
+
+    def _create_and_run_thread(self, target_func, args=()):
+        self.stop_requested.clear()
+        self.stop_and_continue_requested.clear()
+        thread = threading.Thread(target=target_func, args=args)
+        thread.daemon = True
+        thread.start()
+
+    def start_part1_downloader(self):
+        self.view.update_ui_for_task("Part 1", is_running=True)
+        self._create_and_run_thread(self._run_playwright_subprocess)
+
+    def start_part2_processor(self, is_continuation=False):
+        self.view.update_ui_for_task("Part 2", is_running=True, is_continuation=is_continuation)
+        self._create_and_run_thread(self._run_python_processor, args=(False,))
+
+    def start_part2_reprocessor(self):
+        self.view.update_ui_for_task("Part 2", is_running=True)
+        self._create_and_run_thread(self._run_python_processor, args=(True,))
+    def start_api_push(self): self.view.update_ui_for_task("API Push", is_running=True); self._create_and_run_thread(self._run_api_push)
+
+    def _run_playwright_subprocess(self):
+        self.view.log_message("="*80 + "\nStarting Part 1: Playwright Report Downloader...")
+        env_file_path = config.PROJECT_ROOT / '.env'
+        try:
+            parser = configparser.ConfigParser(interpolation=None); parser.read(config.CONFIG_FILE)
+            email, password = parser['credentials'].get('quilgo_email', ''), parser['credentials'].get('quilgo_password', '')
+            if not email or not password: self.view.log_message("ERROR: Quilgo credentials not found."); self.view.update_ui_for_task("Part 1", is_running=False); return
+            with open(env_file_path, 'w') as f: f.write(f'QUILGO_EMAIL="{email}"\nQUILGO_PASSWORD="{password}"\n')
+
+            # Rotate master → backup so Playwright writes into a clean master/
+            rotate_master_to_backup(config.PROJECT_ROOT)
+            self.view.log_message("✔ Rotated previous master → backup.")
+
+            # Write quiz selection for Playwright to read.
+            # Translate internal config key names → actual Quilgo sidebar names before writing,
+            # because Playwright clicks on the sidebar text directly.
+            sidebar_names = [INTERNAL_TO_QUILGO_SIDEBAR_NAME.get(q, q) for q in self.selected_quizzes]
+            with open(config.SELECTED_QUIZZES_FILE, 'w') as f:
+                json.dump(sidebar_names, f)
+            if self.selected_quizzes:
+                self.view.log_message(f"Quiz filter active: {len(self.selected_quizzes)} quiz(es) selected.")
+            else:
+                self.view.log_message("No quiz filter set — downloading all quizzes.")
+            # command = "npx playwright test"
+            # Tell Playwright to use the system's installed Chrome/Edge browser instead of downloading its own.
+            # This removes the need for the user to run the complex "System Setup".
+            npx_cmd = "npx.cmd" if sys.platform == "win32" else "npx"
+            command = [npx_cmd, "playwright", "test", "--browser", "chromium"]
+            self.automation_process = subprocess.Popen(command, cwd=config.PROJECT_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', bufsize=1)
+            for line in iter(self.automation_process.stdout.readline, ''):
+                if self.stop_requested.is_set(): break
+                self.view.log_message(line.strip())
+            self.automation_process.wait()
+            if self.stop_and_continue_requested.is_set():
+                write_manifest(config.PROJECT_ROOT)
+                self.view.log_message("\n⏹ Download stopped early by user. Proceeding to Part 2 with downloaded files...")
+                self.view.show_part1_folder_button()
+                self.start_part2_processor(is_continuation=True)
+            elif self.stop_requested.is_set():
+                self.view.log_message("\n!!! Part 1 STOPPED by user. !!!")
+                self.view.update_ui_for_task("Part 1", is_running=False)
+            elif self.automation_process.returncode == 0:
+                write_manifest(config.PROJECT_ROOT)
+                self.view.log_message("\n✔✔✔ Part 1: Downloader COMPLETED successfully! ✔✔✔"); self.view.show_part1_folder_button()
+                if self.view.auto_continue_var.get(): self.view.log_message("\n--- Auto-continuing to Part 2 ---"); self.start_part2_processor(is_continuation=True)
+                else: self.view.update_ui_for_task("Part 1", is_running=False)
+            else:
+                self.view.log_message(f"\n❌❌❌ Part 1 FAILED. Please check logs. ❌❌❌"); self.view.update_ui_for_task("Part 1", is_running=False)
+        except Exception as e: self.view.log_message(f"\nAn unexpected error in Part 1: {e}"); self.view.update_ui_for_task("Part 1", is_running=False)
+        finally:
+            if os.path.exists(env_file_path): os.remove(env_file_path)
+            if config.SELECTED_QUIZZES_FILE.exists(): config.SELECTED_QUIZZES_FILE.unlink()
+            self.automation_process = None
+
+    def _run_python_processor(self, use_cache):
+        self.view.log_message("="*80 + "\nStarting Part 2: Data Processor...")
+        original_stdout = sys.stdout; sys.stdout = TextRedirector(self.view)
+        success = False
+        try:
+            parser = configparser.ConfigParser(interpolation=None); parser.read(config.CONFIG_FILE)
+            api_key = parser['credentials'].get('manatal_api_key', '')
+            if not api_key: self.view.log_message("ERROR: Manatal API Key not found."); return
+
+            self.final_results, success = processor.run_or_rerun_processing(
+                use_cache=use_cache,
+                api_key=api_key,
+                project_root=config.PROJECT_ROOT,
+                get_manual_review_decision=self.get_decision_from_gui,
+                start_date=self.start_date,
+                end_date=self.end_date,
+            )
+            
+            if self.stop_requested.is_set(): self.view.log_message("\n!!! Part 2 STOPPED by user. !!!")
+            elif success: self.view.log_message("\n✔✔✔ Part 2: Processor COMPLETED successfully! ✔✔✔"); self.view.show_part2_folder_button(); self.view.show_final_review_page(self.final_results)
+            else: self.view.log_message("\n❌❌❌ Part 2 FAILED. Check logs. ❌❌❌")
+        except Exception as e: self.view.log_message(f"\nAn critical error in Part 2: {e}"); traceback.print_exc()
+        finally:
+            sys.stdout = original_stdout
+            if not success: self.view.update_ui_for_task("Part 2", is_running=False)
+
+    def _run_api_push(self):
+        self.view.log_message("="*80 + "\nStarting Final Step: Push to Manatal API...")
+        original_stdout, sys.stdout = sys.stdout, TextRedirector(self.view)
+        try:
+            parser = configparser.ConfigParser(interpolation=None); parser.read(config.CONFIG_FILE)
+            api_key = parser['credentials'].get('manatal_api_key', '')
+            if not api_key: self.view.log_message("ERROR: Manatal API Key not found."); return
+
+            # --- FIX: Pass the potentially edited final_results to the processor ---
+            success = processor.trigger_api_push(api_key, self.final_results)
+
+            if success: self.view.log_message("\n✔✔✔ API Push step COMPLETED. ✔✔✔")
+            else: self.view.log_message("\n❌❌❌ API Push FAILED. Check logs. ❌❌❌")
+        except Exception as e: self.view.log_message(f"\nAn critical error during API Push: {e}"); traceback.print_exc()
+        finally:
+            sys.stdout = original_stdout; self.view.update_ui_for_task("API Push", is_running=False)
+            self.final_results = [] # Clear results after a push attempt
+
+    def get_decision_from_gui(self, candidate_data, role_name, review_num, total_reviews):
+        if self.stop_requested.is_set(): return "skip", "User stopped automation"
+        self.review_event.clear(); self.review_decision = None
+        self.view.controller.after(0, self.view.prompt_for_manual_review, candidate_data, role_name, review_num, total_reviews)
+        self.review_event.wait()
+        return self.review_decision
+
+    def stop_automation(self):
+        self.view.log_message("\n" + "!"*80 + "\n!!! STOP REQUESTED BY USER. !!!\n" + "!"*80)
+        self.stop_requested.set(); self.review_decision = ("skip", "User stopped automation"); self.review_event.set()
+        if self.automation_process:
+            try: self.automation_process.terminate()
+            except Exception as e: self.view.log_message(f"Could not terminate: {e}")
+
+    def stop_and_continue(self):
+        """Stop the Part 1 download early and hand off to Part 2 with whatever was already downloaded."""
+        self.view.log_message("\n⏹ Stop & Continue requested — terminating downloader...")
+        self.stop_and_continue_requested.set()
+        if self.automation_process:
+            try: self.automation_process.terminate()
+            except Exception as e: self.view.log_message(f"Could not terminate downloader: {e}")

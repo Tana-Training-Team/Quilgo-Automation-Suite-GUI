@@ -1,0 +1,26 @@
+services:
+  quilgo-suite:
+    build: .
+    container_name: quilgo-automation-suite
+    ports:
+      - "8501:8501"
+    volumes:
+      # ── Application data (already persisted) ───────────────────────────────
+      # Downloaded Quilgo run folders (Part 1 output)
+      - ./Quilgo:/app/Quilgo
+      # Manatal profile cache, audit logs, and per-run session logs (downloads/logs/)
+      - ./downloads:/app/downloads
+      # Saved credentials — enter them once, reused on every container start
+      - ./gui_config.ini:/app/gui_config.ini
+
+      # ── Playwright artefacts (NEW — persisted so failures are debuggable
+      #    from the host even after the container is stopped or removed) ──────
+      # Traces, screenshots, videos, HAR files produced by failed tests
+      - ./test-results:/app/test-results
+      # Playwright HTML report (if enabled in playwright.config.js)
+      - ./playwright-report:/app/playwright-report
+      # Any ad-hoc artefacts written under the downloader dir
+      - ./playwright_downloader:/app/playwright_downloader
+    environment:
+      - STREAMLIT_SERVER_HEADLESS=true
+    restart: unless-stopped

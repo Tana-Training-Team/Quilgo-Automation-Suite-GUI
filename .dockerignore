@@ -1,0 +1,80 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# .dockerignore — files that should NEVER be copied into the Docker image.
+#
+# Two goals:
+#   1. Keep the image small and fast to build.
+#   2. Avoid baking in stale or sensitive state (secrets, local runs, old
+#      Tkinter UI code that the Streamlit deployment doesn't use).
+#
+# Note: the host filesystem keeps these files — this only affects what lands
+# inside the container. Existing Docker volumes (./Quilgo, ./downloads, etc.)
+# are still mounted at runtime and work as before.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# --- Legacy Tkinter desktop UI ---------------------------------------------
+# Not imported by streamlit_app.py. `app/__init__.py` and `app/config.py` are
+# still copied because Streamlit imports `from app import config`. Only the
+# `ui/` sub-package (Tk views) and the Tk entry point are excluded.
+app/ui/
+main.py
+
+# --- PyInstaller / old desktop build artefacts -----------------------------
+build/
+dist/
+*.spec
+
+# --- Python bytecode and virtualenvs ---------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.Python
+
+# --- Node / Playwright install output --------------------------------------
+# These are installed fresh inside the image via `npm install` + `npx
+# playwright install` in the Dockerfile. Copying host copies would just
+# bloat the image and risk host-vs-container binary mismatches.
+node_modules/
+playwright-report/
+test-results/
+
+# --- Runtime data that belongs on the HOST, not in the image ---------------
+# These are all bind-mounted at runtime via docker-compose.yml, so they
+# must not be baked into the image or they'd shadow the mount on first run.
+Quilgo/
+downloads/
+playwright_downloader/
+
+# --- Secrets & transient files ---------------------------------------------
+# `.env` is written by the GUI at Part 1 launch and deleted at the end.
+# `selected_quizzes.json` is likewise transient. Both may contain user
+# choices (and .env contains credentials) — never ship them in the image.
+.env
+.env.*
+selected_quizzes.json
+gui_config.ini
+playwright_live.log
+
+# --- Editor / OS noise -----------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- Git metadata ----------------------------------------------------------
+.git/
+.gitignore
+.gitattributes
+
+# --- Docker & CI config (shouldn't be inside the image) --------------------
+.dockerignore
+Dockerfile
+docker-compose.yml
+docker-compose.*.yml
+
+# --- Docs / ad-hoc files ---------------------------------------------------
+*.md
+!README.md
