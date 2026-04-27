@@ -22,7 +22,7 @@ WORKDIR /app
 
 # --- Python dependencies first (layer cache) ---
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade pip && pip install --default-timeout=1000 --retries 5 -r requirements.txt
 
 # --- Node.js dependencies ---
 COPY package.json package-lock.json* ./
