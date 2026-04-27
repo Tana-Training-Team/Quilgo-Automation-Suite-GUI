@@ -43,7 +43,7 @@ saves to Quilgo/master/      each candidate by role          in Manatal via API
 ### 1. Clone the repository
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/Tana-Training-Team/Quilgo-Automation-Suite-GUI.git
 cd Quilgo-Automation-Suite-GUI
 ```
 
