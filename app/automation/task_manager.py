@@ -11,7 +11,7 @@ from .. import config
 from ..utils import TextRedirector
 from core import processor
 from core.processing.quilgo_parser import INTERNAL_TO_QUILGO_SIDEBAR_NAME
-from core.processing.file_helpers import rotate_master_to_backup, write_manifest
+from core.processing.file_helpers import prepare_fresh_master, upsert_master_into_backup, write_manifest
 
 class TaskManager:
     """Handles all backend automation tasks."""
@@ -58,9 +58,9 @@ class TaskManager:
             if not email or not password: self.view.log_message("ERROR: Quilgo credentials not found."); self.view.update_ui_for_task("Part 1", is_running=False); return
             with open(env_file_path, 'w') as f: f.write(f'QUILGO_EMAIL="{email}"\nQUILGO_PASSWORD="{password}"\n')
 
-            # Rotate master → backup so Playwright writes into a clean master/
-            rotate_master_to_backup(config.PROJECT_ROOT)
-            self.view.log_message("✔ Rotated previous master → backup.")
+            # Clear master so Playwright writes into a clean directory
+            prepare_fresh_master(config.PROJECT_ROOT)
+            self.view.log_message("✔ Prepared fresh master/ for this run.")
 
             # Write quiz selection for Playwright to read.
             # Translate internal config key names → actual Quilgo sidebar names before writing,
@@ -83,7 +83,8 @@ class TaskManager:
                 self.view.log_message(line.strip())
             self.automation_process.wait()
             if self.stop_and_continue_requested.is_set():
-                write_manifest(config.PROJECT_ROOT)
+                new_rows = upsert_master_into_backup(config.PROJECT_ROOT)
+                write_manifest(config.PROJECT_ROOT, stats_by_file=new_rows)
                 self.view.log_message("\n⏹ Download stopped early by user. Proceeding to Part 2 with downloaded files...")
                 self.view.show_part1_folder_button()
                 self.start_part2_processor(is_continuation=True)
@@ -91,7 +92,8 @@ class TaskManager:
                 self.view.log_message("\n!!! Part 1 STOPPED by user. !!!")
                 self.view.update_ui_for_task("Part 1", is_running=False)
             elif self.automation_process.returncode == 0:
-                write_manifest(config.PROJECT_ROOT)
+                new_rows = upsert_master_into_backup(config.PROJECT_ROOT)
+                write_manifest(config.PROJECT_ROOT, stats_by_file=new_rows)
                 self.view.log_message("\n✔✔✔ Part 1: Downloader COMPLETED successfully! ✔✔✔"); self.view.show_part1_folder_button()
                 if self.view.auto_continue_var.get(): self.view.log_message("\n--- Auto-continuing to Part 2 ---"); self.start_part2_processor(is_continuation=True)
                 else: self.view.update_ui_for_task("Part 1", is_running=False)

@@ -37,6 +37,7 @@ from core.processing.quilgo_parser import (
     ROLE_TO_DROPDOWN_OPTION_MAP,
 )
 from core.processing.candidate_evaluator import _generate_summary_notes
+from core.processing.file_helpers import prepare_fresh_master, upsert_master_into_backup, write_manifest
 
 # ── Page config (must be first Streamlit call) ─────────────────────────────────
 st.set_page_config(
@@ -200,6 +201,10 @@ def _task_playwright(q, email, password, quizzes, auto_continue,
             f.write(f'QUILGO_EMAIL="{email}"\nQUILGO_PASSWORD="{password}"\n')
         q.put("✔ .env file written")
 
+        # Clear master so Playwright writes into a clean directory
+        prepare_fresh_master(config.PROJECT_ROOT)
+        q.put("✔ Prepared fresh master/ for this run.")
+
         # Write quiz selection
         with open(config.SELECTED_QUIZZES_FILE, "w") as f:
             json.dump(quizzes, f)
@@ -265,6 +270,8 @@ def _task_playwright(q, email, password, quizzes, auto_continue,
         q.put(f"[Playwright exit code: {proc.returncode}]")
 
         if proc.returncode == 0:
+            new_rows = upsert_master_into_backup(config.PROJECT_ROOT)
+            write_manifest(config.PROJECT_ROOT, stats_by_file=new_rows)
             q.put("✔✔✔ Part 1 COMPLETED successfully!")
             if auto_continue:
                 q.put("━"*50)
@@ -778,19 +785,31 @@ def page_control():
     if len(log_lines) > TAIL:
         st.caption(f"Showing last {TAIL} of {len(log_lines)} lines · full log in the download below")
 
-    # Offer a download of the current run's full on-disk log (streamed from start)
+    # Offer a download of the current run's full on-disk log (streamed from start).
+    # Cache the bytes in session_state so the media ID stays stable across the
+    # sub-second polling reruns, avoiding MediaFileStorageError noise in the logs.
     lf = st.session_state.get("current_log_file")
     if lf and Path(lf).exists():
         try:
-            with open(lf, "rb") as _fh:
-                st.download_button(
-                    "⬇ Download full run log",
-                    data=_fh.read(),
-                    file_name=Path(lf).name,
-                    mime="text/plain",
-                    key="btn_dl_log",
-                    help=f"Full log file for this run (auto-deleted after {LOG_RETENTION_DAYS} days)",
-                )
+            cache_key = f"_log_bytes_{lf}"
+            if not running:
+                # Task finished — read once and cache so the final log is stable.
+                if cache_key not in st.session_state:
+                    with open(lf, "rb") as _fh:
+                        st.session_state[cache_key] = _fh.read()
+                log_bytes = st.session_state[cache_key]
+            else:
+                # Task still running — read fresh each time but don't cache yet.
+                with open(lf, "rb") as _fh:
+                    log_bytes = _fh.read()
+            st.download_button(
+                "⬇ Download full run log",
+                data=log_bytes,
+                file_name=Path(lf).name,
+                mime="text/plain",
+                key="btn_dl_log",
+                help=f"Full log file for this run (auto-deleted after {LOG_RETENTION_DAYS} days)",
+            )
             st.caption(f"📄 Log file: `{Path(lf).name}` · kept for {LOG_RETENTION_DAYS} days")
         except Exception:
             pass

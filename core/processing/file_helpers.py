@@ -12,25 +12,75 @@ from pathlib import Path
 # Master / backup folder management
 # ---------------------------------------------------------------------------
 
-def rotate_master_to_backup(project_root: Path) -> None:
+def prepare_fresh_master(project_root: Path) -> None:
+    """Clears master/ so Playwright writes into a clean directory each run."""
+    master = project_root / 'Quilgo' / 'master'
+    if master.exists():
+        shutil.rmtree(master)
+    master.mkdir(parents=True, exist_ok=True)
+    print(f"✔ Created fresh Quilgo/master/ for this run.")
+
+
+def upsert_master_into_backup(project_root: Path) -> dict:
     """
-    Moves Quilgo/master/ → Quilgo/backup/ before a new download run.
-    Backup is always overwritten so only one previous copy is kept.
-    A fresh empty master/ is created ready for Playwright to write into.
+    Merges master/ CSVs into backup/ after each Part 1 run.
+
+    Per quiz file:
+      - Emails new to backup  → appended as new rows.
+      - Emails already in backup → their row is replaced with fresh master data.
+      - Emails in backup but absent from master → kept as-is.
+
+    Returns {filename: {"new": int, "updated": int}} so write_manifest can
+    log both types of change separately in the backup manifest.
     """
     master = project_root / 'Quilgo' / 'master'
     backup = project_root / 'Quilgo' / 'backup'
+    backup.mkdir(parents=True, exist_ok=True)
+    stats_by_file: dict = {}
 
-    if master.exists():
-        if backup.exists():
-            shutil.rmtree(backup)
-        shutil.move(str(master), str(backup))
-        print(f"✔ Rotated  Quilgo/master → Quilgo/backup")
-    else:
-        print(f"[INFO] No existing master folder — starting fresh.")
+    for master_csv in sorted(master.glob('*.csv')):
+        name = master_csv.name
+        backup_csv = backup / name
 
-    master.mkdir(parents=True, exist_ok=True)
-    print(f"✔ Created fresh  Quilgo/master/  for this run.")
+        try:
+            master_df = pd.read_csv(master_csv, low_memory=False)
+            email_col = next((c for c in master_df.columns if c.lower() == 'email'), None)
+
+            if not email_col:
+                master_df.to_csv(backup_csv, index=False, encoding='utf-8')
+                stats_by_file[name] = {'new': len(master_df), 'updated': 0}
+                print(f"  ✔ '{name}' → copied to backup (no email column, {len(master_df)} rows)")
+                continue
+
+            master_df['_key'] = master_df[email_col].astype(str).str.lower().str.strip()
+
+            if backup_csv.exists():
+                backup_df = pd.read_csv(backup_csv, low_memory=False)
+                backup_email_col = next((c for c in backup_df.columns if c.lower() == 'email'), email_col)
+                backup_df['_key'] = backup_df[backup_email_col].astype(str).str.lower().str.strip()
+
+                backup_keys  = set(backup_df['_key'])
+                master_keys  = set(master_df['_key'])
+                new_count     = int((~master_df['_key'].isin(backup_keys)).sum())
+                updated_count = int(master_df['_key'].isin(backup_keys).sum())
+
+                untouched  = backup_df[~backup_df['_key'].isin(master_keys)]
+                merged_df  = pd.concat([untouched, master_df], ignore_index=True)
+            else:
+                new_count     = len(master_df)
+                updated_count = 0
+                merged_df     = master_df.copy()
+
+            merged_df = merged_df.drop(columns=['_key'], errors='ignore')
+            merged_df.to_csv(backup_csv, index=False, encoding='utf-8')
+            stats_by_file[name] = {'new': new_count, 'updated': updated_count}
+            print(f"  ✔ '{name}' → backup ({new_count} new, {updated_count} updated, {len(merged_df)} total)")
+
+        except Exception as e:
+            print(f"  ▲ Could not upsert '{name}': {e}")
+            stats_by_file[name] = {'new': 0, 'updated': 0}
+
+    return stats_by_file
 
 
 def get_master_folder(project_root: Path) -> Path | None:
@@ -47,21 +97,64 @@ def get_master_folder(project_root: Path) -> Path | None:
     return master
 
 
-def write_manifest(project_root: Path) -> None:
-    """
-    Writes Quilgo/master/manifest.json recording when each CSV was
-    first created and last updated, plus its current row count.
+def _count_rows(csv_path: Path) -> int:
+    try:
+        with open(csv_path, 'r', encoding='utf-8', errors='replace') as f:
+            return max(0, sum(1 for _ in f) - 1)
+    except Exception:
+        return 0
 
-    Creation dates are preserved from the previous backup manifest so the
-    date a quiz was first ever downloaded is never lost across rotations.
+
+def write_manifest(project_root: Path, stats_by_file: dict | None = None) -> None:
+    """
+    Writes two distinct manifests after each Part 1 run.
+
+    master/manifest.json
+        Tracks this run's fresh download only.
+        'created' = timestamp of this run (master is always a new download).
+        'row_count' = rows in master/ for this run.
+
+    backup/manifest.json
+        Tracks the cumulative growing dataset.
+        'created' = when this quiz CSV first appeared in backup (never changes).
+        'last_updated' = when backup was last modified for this file.
+        'row_count' = total rows now in backup/ (grows across runs).
+        'new_rows_this_run' / 'updated_rows_this_run' = change log per run.
+
+    stats_by_file: {filename: {"new": int, "updated": int}} from upsert_master_into_backup.
     """
     master = project_root / 'Quilgo' / 'master'
     backup = project_root / 'Quilgo' / 'backup'
-    manifest_path = master / 'manifest.json'
+    master_manifest_path = master / 'manifest.json'
     backup_manifest_path = backup / 'manifest.json'
+    stats = stats_by_file or {}
 
-    # Load the previous manifest (from backup) to keep original creation dates
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    # ── master manifest: snapshot of this run's downloads ────────────────────
+    # 'created' is always now — master is a brand-new download every run.
+    master_files: dict = {}
+    for csv_path in sorted(master.glob('*.csv')):
+        name = csv_path.name
+        file_stats = stats.get(name, {})
+        master_files[name] = {
+            'created':              now,
+            'row_count':            _count_rows(csv_path),
+            'new_rows_to_backup':   file_stats.get('new', 0),
+            'updated_rows_in_backup': file_stats.get('updated', 0),
+        }
+
+    with open(master_manifest_path, 'w', encoding='utf-8') as f:
+        json.dump({
+            'last_run':    now,
+            'total_files': len(master_files),
+            'files':       master_files,
+        }, f, indent=2)
+
+    # ── backup manifest: cumulative growing dataset ───────────────────────────
+    # Read the existing backup manifest to preserve 'created' dates.
     prev_files: dict = {}
+    backup.mkdir(parents=True, exist_ok=True)
     if backup_manifest_path.exists():
         try:
             with open(backup_manifest_path, 'r', encoding='utf-8') as f:
@@ -69,42 +162,39 @@ def write_manifest(project_root: Path) -> None:
         except Exception:
             pass
 
-    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-    files: dict = {}
+    # Union of all known files: ones downloaded this run + any from previous runs.
+    all_names = sorted(set(master_files.keys()) | set(prev_files.keys()))
+    backup_files: dict = {}
+    for name in all_names:
+        prev       = prev_files.get(name, {})
+        backup_csv = backup / name
+        file_stats = stats.get(name, {})
+        touched_this_run = name in master_files
 
-    for csv_path in sorted(master.glob('*.csv')):
-        name = csv_path.name
-        prev = prev_files.get(name, {})
-
-        # Count data rows (total lines minus 1 header)
-        try:
-            with open(csv_path, 'r', encoding='utf-8', errors='replace') as f:
-                row_count = max(0, sum(1 for _ in f) - 1)
-        except Exception:
-            row_count = 0
-
-        prev_count = prev.get('row_count', 0)
-        new_rows = max(0, row_count - prev_count)
-
-        files[name] = {
-            'created':      prev.get('created', now),   # keep original creation date
-            'last_updated': now,
-            'row_count':    row_count,
-            'new_rows_this_run': new_rows,
+        backup_files[name] = {
+            # 'created' is set once when the file first appears in backup.
+            'created':                prev.get('created', now),
+            # 'last_updated' only advances when this file was actually upserted.
+            'last_updated':           now if touched_this_run else prev.get('last_updated', now),
+            'row_count':              _count_rows(backup_csv) if backup_csv.exists() else 0,
+            'new_rows_this_run':      file_stats.get('new', 0),
+            'updated_rows_this_run':  file_stats.get('updated', 0),
         }
 
-    manifest = {
-        'last_run': now,
-        'total_files': len(files),
-        'files': files,
-    }
+    with open(backup_manifest_path, 'w', encoding='utf-8') as f:
+        json.dump({
+            'last_run':    now,
+            'total_files': len(backup_files),
+            'files':       backup_files,
+        }, f, indent=2)
 
-    with open(manifest_path, 'w', encoding='utf-8') as f:
-        json.dump(manifest, f, indent=2)
-
-    print(f"\n✔ Manifest written → Quilgo/master/manifest.json")
-    print(f"  {len(files)} file(s) tracked. New rows this run: "
-          f"{sum(v['new_rows_this_run'] for v in files.values())}")
+    total_new     = sum(v['new_rows_this_run']     for v in backup_files.values())
+    total_updated = sum(v['updated_rows_this_run'] for v in backup_files.values())
+    total_backup  = sum(v['row_count']             for v in backup_files.values())
+    print(f"\n✔ Manifests written → master/ and backup/")
+    print(f"  This run : {len(master_files)} file(s) downloaded")
+    print(f"  Backup   : {len(backup_files)} file(s) | {total_backup} total rows "
+          f"| {total_new} new, {total_updated} updated this run")
 
 
 # ---------------------------------------------------------------------------
