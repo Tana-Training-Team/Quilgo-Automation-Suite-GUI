@@ -11,7 +11,7 @@ services:
       # Manatal profile cache, audit logs, and per-run session logs (downloads/logs/)
       - ./downloads:/app/downloads
       # Saved credentials — enter them once, reused on every container start
-      - ./gui_config.ini:/app/gui_config.ini
+      #- ./gui_config.ini:/app/gui_config.ini
 
       # ── Playwright artefacts (NEW — persisted so failures are debuggable
       #    from the host even after the container is stopped or removed) ──────

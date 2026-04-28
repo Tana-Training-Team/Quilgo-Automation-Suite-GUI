@@ -21,8 +21,9 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
 WORKDIR /app
 
 # --- Python dependencies first (layer cache) ---
+RUN pip install --upgrade pip
 COPY requirements.txt .
-RUN pip install --upgrade pip && pip install --default-timeout=1000 --retries 5 -r requirements.txt
+RUN pip install --default-timeout=1000 --retries 5 -r requirements.txt
 
 # --- Node.js dependencies ---
 COPY package.json package-lock.json* ./
