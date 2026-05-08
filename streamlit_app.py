@@ -38,6 +38,7 @@ from core.processing.quilgo_parser import (
 )
 from core.processing.candidate_evaluator import _generate_summary_notes
 from core.processing.file_helpers import prepare_fresh_master, upsert_master_into_backup, write_manifest
+from core.processing.api_pusher import DEFAULT_TEST_EMAILS
 
 # ── Page config (must be first Streamlit call) ─────────────────────────────────
 st.set_page_config(
@@ -86,11 +87,42 @@ def _load_creds():
 
 def _save_creds(email, password, api_key):
     p = configparser.ConfigParser(interpolation=None)
+    p.read(config.CONFIG_FILE)   # preserve other sections (e.g. push_settings)
     p["credentials"] = {"quilgo_email": email,
                         "quilgo_password": password,
                         "manatal_api_key": api_key}
     with open(config.CONFIG_FILE, "w") as f:
         p.write(f)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Push / Test-Mode settings (stored in [push_settings] of gui_config.ini)
+# ══════════════════════════════════════════════════════════════════════════════
+def _load_push_settings():
+    """Return (test_mode: bool, emails: list[str]) from ini, falling back to defaults."""
+    p = configparser.ConfigParser(interpolation=None)
+    p.read(config.CONFIG_FILE)
+    if not p.has_section("push_settings"):
+        return True, sorted(DEFAULT_TEST_EMAILS)
+    s = p["push_settings"]
+    mode = s.getboolean("test_mode", True)
+    raw = s.get("test_candidate_emails", "").strip()
+    if raw:
+        emails = [e.strip() for e in raw.split(",") if e.strip()]
+    else:
+        emails = sorted(DEFAULT_TEST_EMAILS)
+    return mode, emails
+
+
+def _save_push_settings(test_mode: bool, emails: list):
+    p = configparser.ConfigParser(interpolation=None)
+    p.read(config.CONFIG_FILE)   # preserve credentials and other sections
+    p["push_settings"] = {
+        "test_mode": str(test_mode).lower(),
+        "test_candidate_emails": ",".join(e.strip() for e in emails if e.strip()),
+    }
+    with open(config.CONFIG_FILE, "w") as f:
+        p.write(f)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # File-based session logs
@@ -490,7 +522,7 @@ def _drain():
 # Re-evaluate candidate after score edit
 # ══════════════════════════════════════════════════════════════════════════════
 def _reevaluate(candidate):
-    integrity_df = pd.DataFrame()
+    integrity_df = processor.get_cached_integrity_df()
 
     # Roles that currently have a Pending manual decision MUST keep their
     # "MANUAL REVIEW (Pending)" status through re-evaluation. If we let the
@@ -524,7 +556,7 @@ def _reevaluate(candidate):
                 f"QUALIFIED (Manually {final})" if final == "Approved"
                 else f"FAIL (Manually {final})"
             )
-    md, html = _generate_summary_notes(candidate, integrity_df)
+    md, html = _generate_summary_notes(candidate, integrity_df, candidate.get("manual_decisions"))
     candidate["original_row"]["summary_note_md"]   = md
     candidate["original_row"]["summary_note_html"] = html
     qr = [r for r,d in candidate["roles"].items() if "QUALIFIED" in d.get("status","FAIL")]
@@ -533,6 +565,10 @@ def _reevaluate(candidate):
     sp["techtestspassed"] = ([ROLE_TO_DROPDOWN_OPTION_MAP.get(r,r) for r in qr]
                               if qr else ["FAIL: Did not meet minimum requirements"])
     candidate["original_row"]["scores_to_update"] = json.dumps(sp)
+    # Sync the stage-transition flag with the outcome determined above.
+    # Guard against overwriting 'not_attempted' on No Submission candidates.
+    if not candidate["roles"].get("No Submission"):
+        candidate["original_row"]["attempt_outcome"] = "passed" if qr else "attempted_failed"
     return candidate
 
 
@@ -577,6 +613,69 @@ def page_settings():
     if go:
         _save_creds(ne, np_, nk)
         st.session_state.page = "control"; st.rerun()
+
+    st.divider()
+    st.subheader("🛡️ Test Mode Guard")
+    st.caption(
+        "When **Test Mode** is ON, only whitelisted emails are pushed to Manatal. "
+        "All other candidates are skipped and logged. "
+        "Turn it OFF only when you are ready to go live."
+    )
+
+    tm, te = _load_push_settings()
+
+    # Toggle lives outside any form so its value drives conditional rendering.
+    # Saving happens immediately on change so the push guard reflects the new
+    # state without needing a separate "Save" click.
+    def _on_test_mode_change():
+        _save_push_settings(
+            st.session_state["f_test_mode_toggle"],
+            _load_push_settings()[1],
+        )
+
+    new_tm = st.toggle(
+        "Test Mode active",
+        value=tm,
+        key="f_test_mode_toggle",
+        on_change=_on_test_mode_change,
+    )
+
+    if new_tm:
+        st.markdown(
+            "**Test candidate emails** "
+            "<span style='color:#6b7280;font-size:12px;'>(one per line)</span>",
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Defaults (hardcoded in api_pusher.py): "
+            + ", ".join(sorted(DEFAULT_TEST_EMAILS))
+        )
+
+        with st.form("push_emails_form"):
+            email_text = st.text_area(
+                "Emails",
+                value="\n".join(te),
+                height=130,
+                key="f_test_emails",
+                label_visibility="collapsed",
+                placeholder="one email per line",
+                help="Add, edit, or remove emails. The hardcoded defaults are shown above.",
+            )
+            pc1, pc2, _ = st.columns([1, 1, 3])
+            with pc1:
+                save_push = st.form_submit_button("💾 Save emails", type="primary")
+            with pc2:
+                reset_push = st.form_submit_button("↺ Reset to defaults")
+
+        if save_push:
+            parsed = [e.strip().lower() for e in email_text.splitlines() if e.strip()]
+            _save_push_settings(True, parsed)
+            st.success(f"✅ Saved — {len(parsed)} email(s) whitelisted.")
+
+        if reset_push:
+            _save_push_settings(True, sorted(DEFAULT_TEST_EMAILS))
+            st.success("↺ Reset to defaults.")
+            st.rerun()
 
     st.divider()
     st.subheader("System Setup")
@@ -648,6 +747,18 @@ def page_control():
                 st.rerun()
         else:
             st.caption("No filter — all quizzes will be downloaded.")
+
+        st.divider()
+        # Test Mode status badge
+        _tm, _te = _load_push_settings()
+        if _tm:
+            st.warning(
+                f"🛡️ **Test Mode ON** — only {len(_te)} whitelisted email(s) "
+                f"will be pushed.",
+                icon=None,
+            )
+        else:
+            st.success("🚀 **Test Mode OFF** — all candidates will be pushed.")
 
         st.divider()
         if st.button("⚙️ Settings", use_container_width=True, key="nav_s"):
@@ -1059,11 +1170,6 @@ def page_final_review():
     m5.metric("⚖ Manual decisions",  manual)
     m6.metric("⬚ Missing scores",    empty_sc)
 
-    st.caption(
-        f"Scoring rule: a role qualifies when the candidate has **≥ {MIN_PASSING_TESTS} "
-        f"test scores ≥ {PASS_THRESHOLD}**. Scores below {PASS_THRESHOLD} are highlighted; "
-        f"missing scores are shown as `— not taken`."
-    )
 
     # ── Filters ───────────────────────────────────────────────────────────────
     all_roles_seen = sorted({r for c in results for r in c.get("roles", {}).keys()})

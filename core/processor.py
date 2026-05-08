@@ -16,7 +16,8 @@ from .processing.api_pusher import execute_api_push_safely
 # This dictionary will hold data between runs to pass to the API push function
 _cached_data_for_api_push = {
     "all_candidates_df": None,
-    "all_profiles_raw": None
+    "all_profiles_raw": None,
+    "integrity_df": None,
 }
 
 def _run_common_processing_steps(manatal_df, all_manatal_profiles_raw, project_root, get_manual_review_decision, start_date=None, end_date=None):
@@ -56,6 +57,7 @@ def _run_common_processing_steps(manatal_df, all_manatal_profiles_raw, project_r
     all_candidates_to_process = pd.concat([approved_df, rejected_df], ignore_index=True)
     _cached_data_for_api_push['all_candidates_df'] = all_candidates_to_process
     _cached_data_for_api_push['all_profiles_raw'] = all_manatal_profiles_raw
+    _cached_data_for_api_push['integrity_df'] = integrity_df
     
     # --- MODIFICATION: Return the full candidate data list along with the success flag ---
     return final_processed_candidates, True
@@ -149,11 +151,16 @@ def refresh_push_cache_from_results(final_results):
     return len(df)
 
 
-def trigger_api_push(api_key):
+def trigger_api_push(api_key, final_results=None):
     """
     The final, separate step to push the cached results to the Manatal API.
+    If final_results is provided (from the dashboard), the cache is refreshed
+    first so any edits made after Part 2 (approvals, score changes) are included.
     """
     try:
+        if final_results:
+            refresh_push_cache_from_results(final_results)
+
         all_candidates_df = _cached_data_for_api_push.get('all_candidates_df')
         all_profiles_raw = _cached_data_for_api_push.get('all_profiles_raw')
 
@@ -161,21 +168,19 @@ def trigger_api_push(api_key):
             print("❌ ERROR: No processed candidate data found in cache. Please run the processor first.")
             return False
         
-        # ===================================================================
-        # --- UNCOMMENT THE LINE BELOW TO ENABLE THE LIVE API PUSH ---
-        # execute_api_push_safely(all_candidates_df, all_profiles_raw, api_key)
-        # ===================================================================
-        print("\n" + "="*80)
-        print("✅ SIMULATED API PUSH ✅")
-        print("To enable the live push, please uncomment the `execute_api_push_safely` line in `processor.py`.")
-        print(f"This would have pushed data for {len(all_candidates_df)} candidates.")
-        print("="*80)
+        execute_api_push_safely(all_candidates_df, all_profiles_raw, api_key)
         
         return True
     except Exception as e:
         print(f"\n❌ A critical error occurred during the API Push: {e}")
         traceback.print_exc()
         return False
+
+def get_cached_integrity_df():
+    """Returns the integrity_df stored during the last processing run, or an empty DataFrame."""
+    result = _cached_data_for_api_push.get('integrity_df')
+    return result if result is not None else pd.DataFrame()
+
 
 # --- MODIFICATION: The old entry points are now combined into run_or_rerun_processing ---
 # This makes the file cleaner and removes redundant code. The old run_all_processing and

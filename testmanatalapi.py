@@ -23,7 +23,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 CONFIG_FILE = PROJECT_ROOT / 'gui_config.ini'
 OUTPUT_DIR = PROJECT_ROOT / 'Manatal_test_api'
 BASE_URL = "https://api.manatal.com/open/v3"
-JOB_ID = 2619874          # same as manatal_fetcher.py
+JOB_ID = 3635455 # Tech 2619874     none tech 3635455     # same as manatal_fetcher.py
 MAX_MATCH_PAGES = 5        # cap to avoid hammering the API during a test run
 
 
@@ -75,7 +75,7 @@ def main():
     # ------------------------------------------------------------------
     # 1. Job details
     # ------------------------------------------------------------------
-    print(f"\n[1/4] Fetching job details for job ID {JOB_ID}...")
+    print(f"\n[1/5] Fetching job details for job ID {JOB_ID}...")
     job_data = get(f"{BASE_URL}/jobs/{JOB_ID}/", headers)
     if job_data:
         save(job_data, f"{timestamp}_job_details.json")
@@ -83,27 +83,52 @@ def main():
         print(f"      Status    : {job_data.get('status', 'N/A')}")
 
     # ------------------------------------------------------------------
-    # 2. Pipeline stages
+    # 2. Global match-stages (all stages across the account)
     # ------------------------------------------------------------------
-    print(f"\n[2/4] Fetching pipeline stages for job {JOB_ID}...")
+    print(f"\n[2/5] Fetching ALL global match-stages...")
+    stage_counts: dict[str, int] = {}   # stage_name → count
+    stage_ids: dict[int, str] = {}       # stage_id   → stage_name
+    global_stages_data = get(f"{BASE_URL}/match-stages/?page_size=200", headers)
+    if global_stages_data:
+        save(global_stages_data, f"{timestamp}_global_match_stages.json")
+        global_list = global_stages_data if isinstance(global_stages_data, list) else global_stages_data.get('results', [])
+        if global_list:
+            print(f"      Found {len(global_list)} global stage(s):")
+            for s in global_list:
+                sid   = s.get('id')
+                sname = s.get('name', 'N/A')
+                print(f"        ID {sid:>10}  →  {sname}")
+                stage_ids[sid] = sname
+                stage_counts[f"[{sid}] {sname}"] = 0
+        else:
+            print("      No global stages returned — check _global_match_stages.json.")
+
+    # ------------------------------------------------------------------
+    # 3. Job-specific pipeline stages (fallback / cross-check)
+    # ------------------------------------------------------------------
+    print(f"\n[3/5] Fetching job-specific pipeline stages for job {JOB_ID}...")
     stages_data = get(f"{BASE_URL}/jobs/{JOB_ID}/stages/", headers)
     if stages_data:
         save(stages_data, f"{timestamp}_pipeline_stages.json")
         stages_list = stages_data if isinstance(stages_data, list) else stages_data.get('results', [])
         if stages_list:
-            print(f"      Found {len(stages_list)} stage(s):")
+            print(f"      Found {len(stages_list)} job-specific stage(s):")
             for s in stages_list:
-                print(f"        ID {s.get('id'):>10}  →  {s.get('name', 'N/A')}")
+                sid   = s.get('id')
+                sname = s.get('name', 'N/A')
+                print(f"        ID {sid:>10}  →  {sname}")
+                # seed any stages not already in the global list
+                if sid not in stage_ids:
+                    stage_ids[sid] = sname
+                    stage_counts[f"[{sid}] {sname}"] = 0
         else:
-            print("      No stages returned (endpoint may differ — check the raw file).")
+            print("      No job-specific stages returned — check _pipeline_stages.json.")
 
     # ------------------------------------------------------------------
     # 3. First N pages of matches — capture stage distribution
     # ------------------------------------------------------------------
-    print(f"\n[3/4] Fetching up to {MAX_MATCH_PAGES} pages of matches...")
+    print(f"\n[4/5] Fetching up to {MAX_MATCH_PAGES} pages of matches...")
     all_matches = []
-    stage_counts: dict[str, int] = {}   # stage_name → count
-    stage_ids: dict[int, str] = {}       # stage_id   → stage_name
     next_url = f"{BASE_URL}/jobs/{JOB_ID}/matches/?page_size=100"
     page = 0
 
@@ -134,7 +159,7 @@ def main():
     # ------------------------------------------------------------------
     # 4. Stage distribution summary
     # ------------------------------------------------------------------
-    print(f"\n[4/4] Stage distribution across {len(all_matches)} sampled matches:")
+    print(f"\n[5/5] Stage distribution across {len(all_matches)} sampled matches:")
     if stage_counts:
         for label, count in sorted(stage_counts.items(), key=lambda x: -x[1]):
             print(f"      {count:>4}  candidates  in  {label}")

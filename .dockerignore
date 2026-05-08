@@ -46,6 +46,7 @@ test-results/
 Quilgo/
 downloads/
 playwright_downloader/
+check_output/
 
 # --- Secrets & transient files ---------------------------------------------
 # `.env` is written by the GUI at Part 1 launch and deleted at the end.
@@ -63,6 +64,9 @@ playwright_live.log
 *.swp
 .DS_Store
 Thumbs.db
+
+# Editor temporary save files (VS Code / Claude Code atomic-write leftovers)
+*.tmp.*
 
 # --- Git metadata ----------------------------------------------------------
 .git/

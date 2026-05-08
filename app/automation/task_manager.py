@@ -6,6 +6,7 @@ import configparser
 import sys
 import os
 import json
+import traceback
 import pandas as pd
 from .. import config
 from ..utils import TextRedirector
@@ -23,6 +24,7 @@ class TaskManager:
         self.review_event = threading.Event()
         self.review_decision = None
         self.final_results = [] # Persists until a new run starts
+        self.integrity_df = pd.DataFrame()  # Populated after Part 2 so the dashboard can re-evaluate
 
         # Filter state — set by the GUI before starting a run
         self.selected_quizzes: list = []   # Empty = download/process all
@@ -122,7 +124,9 @@ class TaskManager:
                 start_date=self.start_date,
                 end_date=self.end_date,
             )
-            
+            if success:
+                self.integrity_df = processor.get_cached_integrity_df()
+
             if self.stop_requested.is_set(): self.view.log_message("\n!!! Part 2 STOPPED by user. !!!")
             elif success: self.view.log_message("\n✔✔✔ Part 2: Processor COMPLETED successfully! ✔✔✔"); self.view.show_part2_folder_button(); self.view.show_final_review_page(self.final_results)
             else: self.view.log_message("\n❌❌❌ Part 2 FAILED. Check logs. ❌❌❌")

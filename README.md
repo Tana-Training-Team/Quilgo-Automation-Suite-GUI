@@ -1,4 +1,7 @@
+
 # Quilgo Automation Suite
+This is the entry point of the Intagration - streamlit_app.py
+
 
 An end-to-end recruitment automation tool that downloads candidate assessment reports from Quilgo, evaluates them against Manatal ATS profiles, and pushes structured results back to Manatal — all through a browser-based dashboard.
 

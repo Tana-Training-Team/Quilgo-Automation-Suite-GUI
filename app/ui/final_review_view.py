@@ -137,23 +137,31 @@ class FinalReviewView(tk.Frame):
             role_name = decision['role']
             final_decision = decision['decision']
             if role_name in candidate['roles']:
-                new_status = f"QUALIFIED (Manually {final_decision})" if final_decision == "Approved" else f"FAIL (Manually {final_decision})"
-                candidate['roles'][role_name]['status'] = new_status
+                if final_decision == "Approved":
+                    candidate['roles'][role_name]['status'] = "QUALIFIED (Manually Approved)"
+                elif final_decision == "Rejected":
+                    candidate['roles'][role_name]['status'] = "FAIL (Manually Rejected)"
+                # Pending: leave the status from Step 1 (MANUAL REVIEW (Pending)) — do not override
         
         # --- Step 3: Regenerate summary notes and API payload with the updated data ---
-        final_note_md, final_note_html = _generate_summary_notes(candidate, integrity_df)
+        final_note_md, final_note_html = _generate_summary_notes(candidate, integrity_df, candidate.get('manual_decisions'))
         candidate['original_row']['summary_note_md'] = final_note_md
         candidate['original_row']['summary_note_html'] = final_note_html
-        
+
         # Re-determine final qualified roles after all edits
         qualified_roles = [role for role, data in candidate['roles'].items() if "QUALIFIED" in data.get('status', 'FAIL')]
-        
+
         scores_payload = {slug: candidate['original_row'].get(test) for test, slug in SLUG_MAPPING.items() if pd.notna(candidate['original_row'].get(test))}
         if qualified_roles:
             scores_payload['techtestspassed'] = [ROLE_TO_DROPDOWN_OPTION_MAP.get(r, r) for r in qualified_roles]
         else:
             scores_payload['techtestspassed'] = ["FAIL: Did not meet minimum requirements"]
         candidate['original_row']['scores_to_update'] = json.dumps(scores_payload)
+
+        # Keep attempt_outcome in sync so the stage transition is correct after dashboard edits.
+        # Never overwrite 'not_attempted' — No Submission candidates must stay in their current stage.
+        if not candidate['roles'].get('No Submission'):
+            candidate['original_row']['attempt_outcome'] = 'passed' if qualified_roles else 'attempted_failed'
         
         # Update the main data list with the fully re-evaluated candidate object
         self.results_data[candidate_index] = candidate

@@ -4,15 +4,28 @@ import pandas as pd
 import json
 from .quilgo_parser import MASTER_TEST_CONFIG, ROLE_TO_TEST_MAPPING, SLUG_MAPPING, ROLE_TO_DROPDOWN_OPTION_MAP, ROLE_TO_CATEGORY_MAPPING
 
-# Note: The _generate_summary_notes function is unchanged from the previous version.
-def _generate_summary_notes(candidate_eval_data, integrity_df):
+def _generate_summary_notes(candidate_eval_data, integrity_df, manual_decisions=None):
     email = candidate_eval_data['email']
+
     if candidate_eval_data.get('auto_failed_reason'):
-        summary_note_md = f"**Evaluation of Quilgo Assessments**\n\n**Overall Recommendation:** Drop Candidate\n\n**Reason for Automatic Disqualification:**\n{candidate_eval_data['auto_failed_reason']}"
-        summary_note_html = f"<p><strong>Evaluation of Quilgo Assessments</strong></p><p><strong>Overall Recommendation:</strong> Drop Candidate</p><p><strong>Reason for Automatic Disqualification:</strong><br>{candidate_eval_data['auto_failed_reason']}</p>"
+        reason = candidate_eval_data['auto_failed_reason']
+        summary_note_md = (
+            "**Evaluation of Quilgo Assessments**\n\n"
+            "**Overall Recommendation:** Drop Candidate\n\n"
+            f"**Reason for Automatic Disqualification:**\n{reason}"
+        )
+        summary_note_html = (
+            "<p><strong>Evaluation of Quilgo Assessments</strong></p>"
+            "<p><strong>Overall Recommendation:</strong> Drop Candidate</p>"
+            f"<p><strong>Reason for Automatic Disqualification:</strong><br>{reason}</p>"
+        )
         return summary_note_md, summary_note_html
 
-    all_tests_taken = [t for rd in candidate_eval_data['roles'].values() for t in rd.get('tests', [])]
+    roles = candidate_eval_data['roles']
+    qualified_roles = [rn for rn, rd in roles.items() if "QUALIFIED" in rd.get('status', '')]
+    overall_recommendation = "Advance Candidate" if qualified_roles else "Reject Candidate"
+
+    all_tests_taken = [t for rd in roles.values() for t in rd.get('tests', [])]
     total_tests_done = len(all_tests_taken)
     flagged_tests = integrity_df[integrity_df['email'] == email] if not integrity_df.empty else pd.DataFrame()
     num_flagged_tests = len(flagged_tests)
@@ -22,35 +35,84 @@ def _generate_summary_notes(candidate_eval_data, integrity_df):
     flagged_passed_tests_count = 0
     if total_passed_count > 0 and not integrity_df.empty:
         passed_test_names = [t['name'] for t in passed_tests]
-        flagged_passed_tests = integrity_df[(integrity_df['email'] == email) & (integrity_df['test_name'].isin(passed_test_names))]
-        flagged_passed_tests_count = len(flagged_passed_tests)
+        flagged_passed = integrity_df[(integrity_df['email'] == email) & (integrity_df['test_name'].isin(passed_test_names))]
+        flagged_passed_tests_count = len(flagged_passed)
     clean_percent_passed = ((total_passed_count - flagged_passed_tests_count) / total_passed_count * 100) if total_passed_count > 0 else 100
+
+    # Build flagged test lookup for inline annotations in the full breakdown
+    flagged_map = {}
+    if not flagged_tests.empty:
+        for _, fr in flagged_tests.iterrows():
+            flagged_map[fr['test_name']] = fr['Issue_Types']
 
     md_lines = [
         "**Evaluation of Quilgo Assessments**",
-        f"- Total Tests Done: {total_tests_done}",
-        f"- Overall Integrity Score: {num_flagged_tests}/{total_tests_done} flagged ({clean_percent:.0f}% clean)",
-        f"- Passed Tests: {total_passed_count}/{total_tests_done}",
-        f"- Integrity of Passed Tests: {flagged_passed_tests_count}/{total_passed_count} flagged ({clean_percent_passed:.0f}% clean)",
+        f"**Overall Recommendation:** {overall_recommendation}",
     ]
     html_lines = [
-        "<p><strong>Evaluation of Quilgo Assessments</strong></p>", "<ul>",
+        "<p><strong>Evaluation of Quilgo Assessments</strong></p>",
+        f"<p><strong>Overall Recommendation:</strong> {overall_recommendation}</p>",
+    ]
+
+    # Justification from manual review decisions
+    if manual_decisions:
+        justification_parts = [
+            f"{d['role']}: {d['justification']}"
+            for d in manual_decisions
+            if d.get('justification')
+        ]
+        if justification_parts:
+            combined = "; ".join(justification_parts)
+            md_lines.append(f"**Justification:** {combined}")
+            html_lines.append(f"<p><strong>Justification:</strong> {combined}</p>")
+
+    # Full breakdown — per role, per test with score and status
+    md_lines.append("\n**Full Breakdown:**")
+    html_lines.append("<p><strong>Full Breakdown:</strong></p><ul>")
+    for role_name, role_data in roles.items():
+        role_status = role_data.get('status', 'UNKNOWN')
+        tests = role_data.get('tests', [])
+        md_lines.append(f"  - **{role_name}** — {role_status}")
+        html_lines.append(f"<li><strong>{role_name}</strong> — {role_status}<ul>")
+        for test in tests:
+            tname = test['name']
+            tscore = test['score']
+            tstatus = test['status']
+            flag_note = f" | Flag: {flagged_map[tname]}" if tname in flagged_map else ""
+            md_lines.append(f"    - {tname}: {tscore}/10 [{tstatus}]{flag_note}")
+            html_lines.append(f"<li>{tname}: {tscore}/10 [{tstatus}]{flag_note}</li>")
+        html_lines.append("</ul></li>")
+    html_lines.append("</ul>")
+
+    # Integrity flags section
+    md_lines.append("\n**Integrity Flags:**")
+    html_lines.append("<p><strong>Integrity Flags:</strong></p>")
+    if flagged_map:
+        html_lines.append("<ul>")
+        for tname, issues in flagged_map.items():
+            md_lines.append(f"  - {tname}: {issues}")
+            html_lines.append(f"<li>{tname}: {issues}</li>")
+        html_lines.append("</ul>")
+    else:
+        md_lines.append("  - None detected")
+        html_lines.append("<p>None detected</p>")
+
+    # Summary metrics
+    md_lines += [
+        "\n**Scores & Summary:**",
+        f"- Total Tests Done: {total_tests_done}",
+        f"- Overall Integrity Score: {num_flagged_tests}/{total_tests_done} flagged ({clean_percent:.0f}% clean)",
+        f"- Passed Tests (score ≥ 7): {total_passed_count}/{total_tests_done}",
+        f"- Integrity of Passed Tests: {flagged_passed_tests_count}/{total_passed_count} flagged ({clean_percent_passed:.0f}% clean)",
+    ]
+    html_lines += [
+        "<p><strong>Scores &amp; Summary:</strong></p><ul>",
         f"<li>Total Tests Done: {total_tests_done}</li>",
         f"<li>Overall Integrity Score: {num_flagged_tests}/{total_tests_done} flagged ({clean_percent:.0f}% clean)</li>",
-        f"<li>Passed Tests: {total_passed_count}/{total_tests_done}</li>",
+        f"<li>Passed Tests (score ≥ 7): {total_passed_count}/{total_tests_done}</li>",
         f"<li>Integrity of Passed Tests: {flagged_passed_tests_count}/{total_passed_count} flagged ({clean_percent_passed:.0f}% clean)</li>",
         "</ul>",
     ]
-
-    # Per-test integrity breakdown — name exactly what was flagged and why
-    if not flagged_tests.empty:
-        md_lines.append("- **Integrity Flags Detected:**")
-        html_lines.append("<p><strong>Integrity Flags Detected:</strong></p><ul>")
-        for _, flag_row in flagged_tests.iterrows():
-            line = f"  - {flag_row['test_name']}: {flag_row['Issue_Types']}"
-            md_lines.append(line)
-            html_lines.append(f"<li>{flag_row['test_name']}: {flag_row['Issue_Types']}</li>")
-        html_lines.append("</ul>")
 
     summary_note_md = "\n".join(md_lines)
     summary_note_html = "".join(html_lines)
@@ -113,7 +175,8 @@ def evaluate_and_triage_candidates(manatal_df, quilgo_df, integrity_df, get_manu
         candidate_eval = {'email': row['email'], 'full_name': row['full_name'], 'original_row': row.to_dict(), 'roles': {}, 'requires_manual_review': False}
         tests_with_scores = [test for test in MASTER_TEST_CONFIG if pd.notna(row.get(test))]
         if not tests_with_scores:
-            print("  - No test submissions found for this candidate."); candidate_eval['roles']['No Submission'] = {'status': 'NO SUBMISSION', 'tests': []}; all_candidates_eval_data.append(candidate_eval); continue
+            analyzed_quizzes = sorted([t for t in MASTER_TEST_CONFIG if t in downloaded_tests])
+            print("  - No test submissions found for this candidate."); candidate_eval['roles']['No Submission'] = {'status': 'NO SUBMISSION', 'tests': [], 'analyzed_quizzes': analyzed_quizzes}; all_candidates_eval_data.append(candidate_eval); continue
         for role, tests_for_role in active_roles.items():
             print(f"\n--- Evaluating Role: {role} ---")
             role_category = ROLE_TO_CATEGORY_MAPPING.get(role, 'tech')
@@ -241,17 +304,23 @@ def evaluate_and_triage_candidates(manatal_df, quilgo_df, integrity_df, get_manu
     for candidate in final_processed_candidates:
         row_dict = candidate['original_row']
         if candidate['roles'].get('No Submission'):
-            row_dict['summary_note_md'] = "**Status:** No Submission\n\n**Recommendation:** ... "
-            row_dict['summary_note_html'] = "<p><strong>Status:</strong> No Submission...</p>"
+            row_dict['attempt_outcome'] = 'not_attempted'
+            analyzed = candidate['roles']['No Submission'].get('analyzed_quizzes', list(MASTER_TEST_CONFIG.keys()))
+            quiz_list_md = ', '.join(analyzed) if analyzed else 'N/A'
+            quiz_list_html = ', '.join(analyzed) if analyzed else 'N/A'
+            row_dict['summary_note_md'] = f"**Status:** No Submission\n\n**Quizzes Analyzed:** {quiz_list_md}\n\n**Recommendation:** Candidate did not submit any of the assessed quizzes."
+            row_dict['summary_note_html'] = f"<p><strong>Status:</strong> No Submission</p><p><strong>Quizzes Analyzed:</strong> {quiz_list_html}</p><p><strong>Recommendation:</strong> Candidate did not submit any of the assessed quizzes.</p>"
             row_dict['scores_to_update'] = json.dumps({'techtestspassed': ['FAIL: No Submission']})
         else:
-            final_note_md, final_note_html = _generate_summary_notes(candidate, integrity_df)
+            final_note_md, final_note_html = _generate_summary_notes(candidate, integrity_df, candidate.get('manual_decisions'))
             row_dict['summary_note_md'] = final_note_md
             row_dict['summary_note_html'] = final_note_html
             qualified_roles = [role for role, data in candidate['roles'].items() if "QUALIFIED" in data.get('status', 'FAIL')]
             scores_payload = {slug: row_dict.get(test) for test, slug in SLUG_MAPPING.items() if pd.notna(row_dict.get(test))}
             scores_payload['techtestspassed'] = [ROLE_TO_DROPDOWN_OPTION_MAP.get(r, r) for r in qualified_roles] if qualified_roles else ["FAIL: Did not meet minimum requirements"]
             row_dict['scores_to_update'] = json.dumps(scores_payload)
+            # Outcome used by api_pusher to select the correct Manatal stage transition
+            row_dict['attempt_outcome'] = 'passed' if qualified_roles else 'attempted_failed'
         final_rows.append(row_dict)
 
     if not final_rows: return [], pd.DataFrame(), pd.DataFrame()

@@ -528,8 +528,9 @@ class ControlPanelView(tk.Frame):
 
     def update_ui_for_task(self, part, is_running, is_continuation=False):
         if is_running:
-            # When a new task starts, clear the previous final results
-            if not is_continuation:
+            # When a new task starts, clear the previous final results.
+            # Do NOT clear for API Push — that step needs the results to refresh its cache.
+            if not is_continuation and part != "API Push":
                 self.task_manager.final_results = []
                 self._clear_log_content()
                 self.timer_running = True
