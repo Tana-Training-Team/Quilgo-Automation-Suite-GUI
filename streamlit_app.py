@@ -1546,7 +1546,7 @@ def page_final_review():
 def main():
     with st.sidebar:
         if (config.ASSETS_DIR / "logo.png").exists():
-            st.image(str(config.ASSETS_DIR / "logo.png"))
+            st.image(str(config.ASSETS_DIR / "logo.png"), width=120)
         st.title("Navigation")
         if st.button("⚙️ Settings",      use_container_width=True, key="nav_settings"):
             st.session_state.page = "settings"; st.rerun()
