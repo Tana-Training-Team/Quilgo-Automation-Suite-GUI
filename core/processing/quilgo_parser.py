@@ -6,42 +6,42 @@ import pandas as pd
 MASTER_TEST_CONFIG = {
 
     # ── QA Engineer ──────────────────────────────────────────
-    'APIs & Postman':   {'slug': 'apis',          'roles': ['QA Engineer'], 'type': 'Required', 'category': 'non-tech'},
-    'JavaScript':       {'slug': 'javascript',    'roles': ['QA Engineer'], 'type': 'Optional', 'category': 'non-tech'},
-    'Typescript':       {'slug': 'typescrpt',     'roles': ['QA Engineer'], 'type': 'Optional', 'category': 'non-tech'},
-    'Java':             {'slug': 'java',           'roles': ['QA Engineer'], 'type': 'Optional', 'category': 'non-tech'},
-    'Python: General':  {'slug': 'pythongeneral', 'roles': ['QA Engineer'], 'type': 'Optional', 'category': 'non-tech'},
-    'Selenium':         {'slug': 'selenium',      'roles': ['QA Engineer'], 'type': 'Optional', 'category': 'non-tech'},
-    'Cypress':          {'slug': 'cypress',       'roles': ['QA Engineer'], 'type': 'Optional', 'category': 'non-tech'},
+    'APIs & Postman':   {'slug': 'apis',          'roles': ['QA Engineer'], 'type': 'Required', 'category': 'tech'},
+    'JavaScript':       {'slug': 'javascript',    'roles': ['QA Engineer'], 'type': 'Optional', 'category': 'tech'},
+    'Typescript':       {'slug': 'typescrpt',     'roles': ['QA Engineer'], 'type': 'Optional', 'category': 'tech'},
+    'Java':             {'slug': 'java',           'roles': ['QA Engineer'], 'type': 'Optional', 'category': 'tech'},
+    'Python: General':  {'slug': 'pythongeneral', 'roles': ['QA Engineer'], 'type': 'Optional', 'category': 'tech'},
+    'Selenium':         {'slug': 'selenium',      'roles': ['QA Engineer'], 'type': 'Optional', 'category': 'tech'},
+    'Cypress':          {'slug': 'cypress',       'roles': ['QA Engineer'], 'type': 'Optional', 'category': 'tech'},
   # ── Data Analyst ─────────────────────────────────────────
-    'Excel':            {'slug': 'excel',         'roles': ['Data Analyst'],              'type': 'Required', 'category': 'non-tech'},
-    'SQL':              {'slug': 'sql',            'roles': ['Data Analyst'],              'type': 'Required', 'category': 'non-tech'},
-    'Python: Data':     {'slug': 'pythondata',    'roles': ['Data Analyst','Data Science'],'type': 'Required', 'category': 'non-tech'},
-    'Data Viz: Tableau':{'slug': 'dataviztableau','roles': ['Data Analyst'],              'type': 'Optional', 'category': 'non-tech'},
-    'Data Viz: PowerBI':{'slug': 'datavizpowerbi','roles': ['Data Analyst'],              'type': 'Optional', 'category': 'non-tech'},
-    'Data Viz: Looker': {'slug': 'datavizlooker', 'roles': ['Data Analyst'],              'type': 'Optional', 'category': 'non-tech'},
+    'Excel':            {'slug': 'excel',         'roles': ['Data Analyst'],              'type': 'Required', 'category': 'tech'},
+    'SQL':              {'slug': 'sql',            'roles': ['Data Analyst'],              'type': 'Required', 'category': 'tech'},
+    'Python: Data':     {'slug': 'pythondata',    'roles': ['Data Analyst','Data Science'],'type': 'Required', 'category': 'tech'},
+    'Data Viz: Tableau':{'slug': 'dataviztableau','roles': ['Data Analyst'],              'type': 'Optional', 'category': 'tech'},
+    'Data Viz: PowerBI':{'slug': 'datavizpowerbi','roles': ['Data Analyst'],              'type': 'Optional', 'category': 'tech'},
+    'Data Viz: Looker': {'slug': 'datavizlooker', 'roles': ['Data Analyst'],              'type': 'Optional', 'category': 'tech'},
 
     # ── Data Science ─────────────────────────────────────────
-    'Statistics':       {'slug': 'statistics',   'roles': ['Data Science'], 'type': 'Required', 'category': 'non-tech'},
-    'Machine Learning': {'slug': 'machinelearning','roles': ['Data Science'],'type': 'Required', 'category': 'non-tech'},
+    'Statistics':       {'slug': 'statistics',   'roles': ['Data Science'], 'type': 'Required', 'category': 'tech'},
+    'Machine Learning': {'slug': 'machinelearning','roles': ['Data Science'],'type': 'Required', 'category': 'tech'},
 
     # ── Tech Support Engineering ──────────────────────────────
-    'Networking':         {'slug': 'networking', 'roles': ['Tech Support Engineering'], 'type': 'Required', 'category': 'non-tech'},
-    'Logs & Errors':      {'slug': 'logserrors', 'roles': ['Tech Support Engineering'], 'type': 'Required', 'category': 'non-tech'},
-    'OS Commands: Linux': {'slug': 'oslinux',   'roles': ['Tech Support Engineering'], 'type': 'Optional', 'category': 'non-tech'},
-    'OS Commands: Windows':{'slug': 'oswindows','roles': ['Tech Support Engineering'], 'type': 'Optional', 'category': 'non-tech'},
+    'Networking':         {'slug': 'networking', 'roles': ['Tech Support Engineering'], 'type': 'Required', 'category': 'tech'},
+    'Logs & Errors':      {'slug': 'logserrors', 'roles': ['Tech Support Engineering'], 'type': 'Required', 'category': 'tech'},
+    'OS Commands: Linux': {'slug': 'oslinux',   'roles': ['Tech Support Engineering'], 'type': 'Optional', 'category': 'tech'},
+    'OS Commands: Windows':{'slug': 'oswindows','roles': ['Tech Support Engineering'], 'type': 'Optional', 'category': 'tech'},
 
     # ── UI/UX ─────────────────────────────────────────────────
-    'Figma':    {'slug': 'figma',   'roles': ['UI/UX'], 'type': 'Required', 'category': 'non-tech'},
-    'Adobe XD': {'slug': 'adobexd','roles': ['UI/UX'], 'type': 'Required', 'category': 'non-tech'},
-    'Sketch':   {'slug': 'sketch', 'roles': ['UI/UX'], 'type': 'Required', 'category': 'non-tech'},
+    'Figma':    {'slug': 'figma',   'roles': ['UI/UX'], 'type': 'Required', 'category': 'tech'},
+    'Adobe XD': {'slug': 'adobexd','roles': ['UI/UX'], 'type': 'Required', 'category': 'tech'},
+    'Sketch':   {'slug': 'sketch', 'roles': ['UI/UX'], 'type': 'Required', 'category': 'tech'},
 
     # ── DevOps / SRE ─────────────────────────────────────────
-    'Git & CI/CD': {'slug': 'git',       'roles': ['DevOps / SRE'], 'type': 'Required', 'category': 'non-tech'},
-    'AWS':         {'slug': 'aws',       'roles': ['DevOps / SRE'], 'type': 'Required', 'category': 'non-tech'},
-    'Azure':       {'slug': 'azure',     'roles': ['DevOps / SRE'], 'type': 'Required', 'category': 'non-tech'},
-    'Docker':      {'slug': 'docker',    'roles': ['DevOps / SRE'], 'type': 'Optional', 'category': 'non-tech'},
-    'Kubernetes':  {'slug': 'kubernetes','roles': ['DevOps / SRE'], 'type': 'Optional', 'category': 'non-tech'},
+    'Git & CI/CD': {'slug': 'git',       'roles': ['DevOps / SRE'], 'type': 'Required', 'category': 'tech'},
+    'AWS':         {'slug': 'aws',       'roles': ['DevOps / SRE'], 'type': 'Required', 'category': 'tech'},
+    'Azure':       {'slug': 'azure',     'roles': ['DevOps / SRE'], 'type': 'Required', 'category': 'tech'},
+    'Docker':      {'slug': 'docker',    'roles': ['DevOps / SRE'], 'type': 'Optional', 'category': 'tech'},
+    'Kubernetes':  {'slug': 'kubernetes','roles': ['DevOps / SRE'], 'type': 'Optional', 'category': 'tech'},
 }
 
 
