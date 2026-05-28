@@ -76,7 +76,13 @@ INTERNAL_TO_QUILGO_SIDEBAR_NAME = {
 }
 
 ROLE_TO_DROPDOWN_OPTION_MAP = {
-    'QA Engineer': 'Quality Assurance (QA) Engineer', 'Data Analyst': 'Data Analyst', 'Data Science': 'Data Science', 'Tech Support Engineering': 'Tech Support Engineering', 'UI/UX': 'UI/UX', 'DevOps / SRE': 'DevOps / Site Reliability Engineer'
+    'QA Engineer':              'Quality Assurance (QA) Engineer',
+    'Data Analyst':             'Data Analyst',
+    'Data Science':             'Data Science',
+    'Tech Support Engineering': 'Tech Support Engineering',
+    'UI/UX':                    'UI/UX',
+    'DevOps / SRE':             'DevOps / Site Reliability Engineer',
+    'None-Tech':                'Non-Tech',
 }
 # Explicit mapping — tech roles come from Manatal job 2619874, non-tech from job 3635455.
 # Must stay in sync with JOB_CONFIGS in manatal_fetcher.py.

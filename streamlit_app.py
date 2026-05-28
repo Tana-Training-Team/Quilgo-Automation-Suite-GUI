@@ -1001,17 +1001,21 @@ def _render_review():
     st.caption(f"📧 {c.get('email','N/A')}")
 
     role_data = c.get("roles",{}).get(pr["role_name"],{})
-    reasons   = [r for r in role_data.get("manual_review_reasons",[]) if "integrity" in r]
-    st.markdown(f"**Role:** `{pr['role_name']}`")
+    reasons   = role_data.get("manual_review_reasons", [])
+    st.markdown(f"**Role:** `{_rl(pr['role_name'])}`")
     if reasons:
         st.error("Integrity flags:\n" + "\n".join(f"- {r}" for r in reasons))
 
     with st.expander("Full breakdown", expanded=True):
         for rname, rdata in c.get("roles",{}).items():
             if not rdata.get("tests"): continue
-            st.markdown(f"**{'🟡' if 'MANUAL' in rdata.get('status','') else ('🟢' if 'QUALIFIED' in rdata.get('status','') else '🔴')} {rname}** — {rdata.get('status','')}")
-            for t in rdata.get("tests",[]):
-                st.markdown(f"&nbsp;&nbsp;• {t.get('name')}: **{t.get('score','N/A')}** | {t.get('status','')}", unsafe_allow_html=True)
+            st.markdown(f"**{'🟡' if 'MANUAL' in rdata.get('status','') else ('🟢' if 'QUALIFIED' in rdata.get('status','') else '🔴')} {_rl(rname)}** — {rdata.get('status','')}")
+            _reasons = rdata.get("manual_review_reasons", [])
+            for t in rdata.get("tests", []):
+                tname = t.get("name", "?")
+                detail = next((r[len(tname) + 2:] for r in _reasons if r.startswith(tname + ": ")), "")
+                detail_str = f" | ⚠ {detail}" if detail else ""
+                st.markdown(f"&nbsp;&nbsp;• {tname}: **{t.get('score','N/A')}** | {t.get('status','')}{detail_str}", unsafe_allow_html=True)
 
     just = st.text_area("Justification (required for Approve/Reject)", key="rv_just", height=80)
 
@@ -1083,6 +1087,11 @@ def _normalise_pending(cand):
     if added:
         cand["manual_decisions"] = decs
     return added
+
+def _rl(role: str) -> str:
+    """Return the user-facing display label for a role name."""
+    return 'Non-Tech' if role == 'None-Tech' else role
+
 
 def _final_status(cand):
     # A candidate with any Pending decision is neither APPROVED nor REJECTED
@@ -1315,7 +1324,7 @@ def page_final_review():
                    and not has_manual and not has_empty and not has_pending)
 
         if compact:
-            roles_line = ", ".join(qroles) if qroles else "—"
+            roles_line = ", ".join(_rl(r) for r in qroles) if qroles else "—"
             st.markdown(
                 f"<div style='padding:8px 12px;border:1px solid #e5e7eb;"
                 f"border-radius:6px;margin-bottom:6px;'>"
@@ -1355,7 +1364,7 @@ def page_final_review():
             #      status icon + status, then per-test `name: score | status`
             # Nothing else.
 
-            if qroles: st.success("Qualified for: " + ", ".join(qroles))
+            if qroles: st.success("Qualified for: " + ", ".join(_rl(r) for r in qroles))
             else:      st.error("Did not meet requirements for any role.")
 
             # (2) Integrity flags — same filter the overlay uses:
@@ -1363,13 +1372,12 @@ def page_final_review():
             integrity_reasons = []
             for rname, rdata in cand.get("roles", {}).items():
                 for reason in rdata.get("manual_review_reasons", []):
-                    if "integrity" in reason.lower():
-                        integrity_reasons.append((rname, reason))
+                    integrity_reasons.append((rname, reason))
             if integrity_reasons:
                 # st.error can't render a role→reason list cleanly, so we
                 # hand-roll a red box that matches the overlay's styling.
                 items = "".join(
-                    f"<li><b>{_html_escape(rn)}</b> — {_html_escape(r)}</li>"
+                    f"<li><b>{_html_escape(_rl(rn))}</b> — {_html_escape(r)}</li>"
                     for rn, r in integrity_reasons
                 )
                 st.markdown(
@@ -1395,17 +1403,20 @@ def page_final_review():
                         elif "QUALIFIED" in rstatus:  icon = "🟢"
                         else:                         icon = "🔴"
                         st.markdown(
-                            f"**{icon} {_html_escape(rname)}** — "
+                            f"**{icon} {_html_escape(_rl(rname))}** — "
                             f"{_html_escape(rstatus)}"
                         )
+                        _reasons = rdata.get("manual_review_reasons", [])
                         for t in rdata.get("tests", []):
                             tname = t.get("name", "?")
                             tscore = t.get("score", "N/A")
                             tstatus = t.get("status", "")
+                            detail = next((r[len(tname) + 2:] for r in _reasons if r.startswith(tname + ": ")), "")
+                            detail_str = f" | ⚠ {_html_escape(detail)}" if detail else ""
                             st.markdown(
                                 f"&nbsp;&nbsp;• {_html_escape(tname)}: "
                                 f"**{_html_escape(str(tscore))}** | "
-                                f"{_html_escape(tstatus)}",
+                                f"{_html_escape(tstatus)}{detail_str}",
                                 unsafe_allow_html=True,
                             )
 
@@ -1485,7 +1496,7 @@ def page_final_review():
 
                     # Section header — makes it obvious which role this
                     # decision block applies to.
-                    st.markdown(f"**Role:** `{_html_escape(rn)}`")
+                    st.markdown(f"**Role:** `{_html_escape(_rl(rn))}`")
 
                     just_key = f"pj_{i}_{j}"
                     nj = st.text_area(

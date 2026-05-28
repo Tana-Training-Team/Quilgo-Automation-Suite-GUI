@@ -67,13 +67,14 @@ def _generate_summary_notes(candidate_eval_data, integrity_df, manual_decisions=
             html_lines.append(f"<p><strong>Justification:</strong> {combined}</p>")
 
     # Full breakdown — per role, per test with score and status
+    _rl = lambda r: 'Non-Tech' if r == 'None-Tech' else r  # display label
     md_lines.append("\n**Full Breakdown:**")
     html_lines.append("<p><strong>Full Breakdown:</strong></p><ul>")
     for role_name, role_data in roles.items():
         role_status = role_data.get('status', 'UNKNOWN')
         tests = role_data.get('tests', [])
-        md_lines.append(f"  - **{role_name}** — {role_status}")
-        html_lines.append(f"<li><strong>{role_name}</strong> — {role_status}<ul>")
+        md_lines.append(f"  - **{_rl(role_name)}** — {role_status}")
+        html_lines.append(f"<li><strong>{_rl(role_name)}</strong> — {role_status}<ul>")
         for test in tests:
             tname = test['name']
             tscore = test['score']
