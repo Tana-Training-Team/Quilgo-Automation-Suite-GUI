@@ -2,46 +2,51 @@
 
 import pandas as pd
 
-# --- Quilgo Test Configurations (Unchanged) ---
+# --- Quilgo Test Configurations ---
+# Each test name is unique. Tests shared between tech and non-tech pipelines list
+# all applicable roles together; the per-candidate category filter in the evaluator
+# ensures a candidate is only scored against roles from their own pipeline.
 MASTER_TEST_CONFIG = {
 
-    # ── QA Engineer ──────────────────────────────────────────
-    'APIs & Postman':   {'slug': 'apis',          'roles': ['QA Engineer'], 'type': 'Optional', 'category': 'tech'},
-    'JavaScript':       {'slug': 'javascript',    'roles': ['QA Engineer'], 'type': 'Optional', 'category': 'tech'},
-    'Typescript':       {'slug': 'typescrpt',     'roles': ['QA Engineer'], 'type': 'Optional', 'category': 'tech'},
-    'Java':             {'slug': 'java',           'roles': ['QA Engineer'], 'type': 'Optional', 'category': 'tech'},
-    'Python: General':  {'slug': 'pythongeneral', 'roles': ['QA Engineer'], 'type': 'Optional', 'category': 'tech'},
-    'Selenium':         {'slug': 'selenium',      'roles': ['QA Engineer'], 'type': 'Optional', 'category': 'tech'},
-    'Cypress':          {'slug': 'cypress',       'roles': ['QA Engineer'], 'type': 'Optional', 'category': 'tech'},
-  # ── Data Analyst ─────────────────────────────────────────
-    'Excel':            {'slug': 'excel',         'roles': ['Data Analyst'],              'type': 'Optional', 'category': 'tech'},
-    'SQL':              {'slug': 'sql',            'roles': ['Data Analyst'],              'type': 'Optional', 'category': 'tech'},
-    'Python: Data':     {'slug': 'pythondata',    'roles': ['Data Analyst','Data Science'],'type': 'Optional', 'category': 'tech'},
-    'Data Viz: Tableau':{'slug': 'dataviztableau','roles': ['Data Analyst'],              'type': 'Optional', 'category': 'tech'},
-    'Data Viz: PowerBI':{'slug': 'datavizpowerbi','roles': ['Data Analyst'],              'type': 'Optional', 'category': 'tech'},
-    'Data Viz: Looker': {'slug': 'datavizlooker', 'roles': ['Data Analyst'],              'type': 'Optional', 'category': 'tech'},
+    # ── QA Engineer (tech only) ───────────────────────────────
+    'APIs & Postman':    {'slug': 'apis',           'roles': ['QA Engineer'],                               'type': 'Optional'},
+    'JavaScript':        {'slug': 'javascript',     'roles': ['QA Engineer'],                               'type': 'Optional'},
+    'Typescript':        {'slug': 'typescrpt',      'roles': ['QA Engineer'],                               'type': 'Optional'},
+    'Java':              {'slug': 'java',            'roles': ['QA Engineer'],                               'type': 'Optional'},
+    'Python: General':   {'slug': 'pythongeneral',  'roles': ['QA Engineer'],                               'type': 'Optional'},
+    'Selenium':          {'slug': 'selenium',       'roles': ['QA Engineer'],                               'type': 'Optional'},
+    'Cypress':           {'slug': 'cypress',        'roles': ['QA Engineer'],                               'type': 'Optional'},
 
-    # ── Data Science ─────────────────────────────────────────
-    'Statistics':       {'slug': 'statistics',   'roles': ['Data Science'], 'type': 'Optional', 'category': 'tech'},
-    'Machine Learning': {'slug': 'machinelearning','roles': ['Data Science'],'type': 'Optional', 'category': 'tech'},
+    # ── Data Analyst (tech) + None-Tech (non-tech) ────────────
+    'Excel':             {'slug': 'excel',          'roles': ['Data Analyst', 'None-Tech'],                 'type': 'Optional'},
+    'SQL':               {'slug': 'sql',            'roles': ['Data Analyst', 'None-Tech'],                 'type': 'Optional'},
+    'Python: Data':      {'slug': 'pythondata',     'roles': ['Data Analyst', 'Data Science', 'None-Tech'], 'type': 'Optional'},
+    'Data Viz: Tableau': {'slug': 'dataviztableau', 'roles': ['Data Analyst', 'None-Tech'],                 'type': 'Optional'},
+    'Data Viz: PowerBI': {'slug': 'datavizpowerbi', 'roles': ['Data Analyst', 'None-Tech'],                 'type': 'Optional'},
+    'Data Viz: Looker':  {'slug': 'datavizlooker',  'roles': ['Data Analyst', 'None-Tech'],                 'type': 'Optional'},
 
-    # ── Tech Support Engineering ──────────────────────────────
-    'Networking':         {'slug': 'networking', 'roles': ['Tech Support Engineering'], 'type': 'Optional', 'category': 'tech'},
-    'Logs & Errors':      {'slug': 'logserrors', 'roles': ['Tech Support Engineering'], 'type': 'Optional', 'category': 'tech'},
-    'OS Commands: Linux': {'slug': 'oslinux',   'roles': ['Tech Support Engineering'], 'type': 'Optional', 'category': 'tech'},
-    'OS Commands: Windows':{'slug': 'oswindows','roles': ['Tech Support Engineering'], 'type': 'Optional', 'category': 'tech'},
+    # ── Data Science (tech) + None-Tech (non-tech) ────────────
+    'Statistics':        {'slug': 'statistics',    'roles': ['Data Science', 'None-Tech'],                  'type': 'Optional'},
+    'Machine Learning':  {'slug': 'machinelearning','roles': ['Data Science'],                              'type': 'Optional'},
 
-    # ── UI/UX ─────────────────────────────────────────────────
-    'Figma':    {'slug': 'figma',   'roles': ['UI/UX'], 'type': 'Optional', 'category': 'tech'},
-    'Adobe XD': {'slug': 'adobexd','roles': ['UI/UX'], 'type': 'Optional', 'category': 'tech'},
-    'Sketch':   {'slug': 'sketch', 'roles': ['UI/UX'], 'type': 'Optional', 'category': 'tech'},
+    # ── Tech Support Engineering (tech) + None-Tech (non-tech) ─
+    'Networking':        {'slug': 'networking',    'roles': ['Tech Support Engineering', 'None-Tech'],      'type': 'Optional'},
+    'Logs & Errors':     {'slug': 'logserrors',    'roles': ['Tech Support Engineering'],                   'type': 'Optional'},
+    'OS Commands: Linux':{'slug': 'oslinux',       'roles': ['Tech Support Engineering'],                   'type': 'Optional'},
+    'OS Commands: Windows':{'slug': 'oswindows',   'roles': ['Tech Support Engineering'],                   'type': 'Optional'},
 
-    # ── DevOps / SRE ─────────────────────────────────────────
-    'Git & CI/CD': {'slug': 'git',       'roles': ['DevOps / SRE'], 'type': 'Optional', 'category': 'tech'},
-    'AWS':         {'slug': 'aws',       'roles': ['DevOps / SRE'], 'type': 'Optional', 'category': 'tech'},
-    'Azure':       {'slug': 'azure',     'roles': ['DevOps / SRE'], 'type': 'Optional', 'category': 'tech'},
-    'Docker':      {'slug': 'docker',    'roles': ['DevOps / SRE'], 'type': 'Optional', 'category': 'tech'},
-    'Kubernetes':  {'slug': 'kubernetes','roles': ['DevOps / SRE'], 'type': 'Optional', 'category': 'tech'},
+    # ── UI/UX (tech) + None-Tech (non-tech) ───────────────────
+    'Figma':             {'slug': 'figma',          'roles': ['UI/UX', 'None-Tech'],                        'type': 'Optional'},
+    'Adobe XD':          {'slug': 'adobexd',        'roles': ['UI/UX', 'None-Tech'],                        'type': 'Optional'},
+    'Sketch':            {'slug': 'sketch',         'roles': ['UI/UX', 'None-Tech'],                        'type': 'Optional'},
+
+    # ── DevOps / SRE (tech only) ──────────────────────────────
+    'Git & CI/CD':       {'slug': 'git',            'roles': ['DevOps / SRE'],                              'type': 'Optional'},
+    'AWS':               {'slug': 'aws',            'roles': ['DevOps / SRE'],                              'type': 'Optional'},
+    'Azure':             {'slug': 'azure',          'roles': ['DevOps / SRE'],                              'type': 'Optional'},
+    'Docker':            {'slug': 'docker',         'roles': ['DevOps / SRE'],                              'type': 'Optional'},
+    'Kubernetes':        {'slug': 'kubernetes',     'roles': ['DevOps / SRE'],                              'type': 'Optional'},
+
 }
 
 
@@ -73,12 +78,17 @@ INTERNAL_TO_QUILGO_SIDEBAR_NAME = {
 ROLE_TO_DROPDOWN_OPTION_MAP = {
     'QA Engineer': 'Quality Assurance (QA) Engineer', 'Data Analyst': 'Data Analyst', 'Data Science': 'Data Science', 'Tech Support Engineering': 'Tech Support Engineering', 'UI/UX': 'UI/UX', 'DevOps / SRE': 'DevOps / Site Reliability Engineer'
 }
-# Derived from MASTER_TEST_CONFIG — 'tech' or 'non-tech' per role.
-# All tests in a role must share the same category for this to be correct.
-ROLE_TO_CATEGORY_MAPPING = {}
-for _test_name, _details in MASTER_TEST_CONFIG.items():
-    for _role in _details['roles']:
-        ROLE_TO_CATEGORY_MAPPING.setdefault(_role, _details.get('category', 'tech'))
+# Explicit mapping — tech roles come from Manatal job 2619874, non-tech from job 3635455.
+# Must stay in sync with JOB_CONFIGS in manatal_fetcher.py.
+ROLE_TO_CATEGORY_MAPPING = {
+    'QA Engineer':              'tech',
+    'Data Analyst':             'tech',
+    'Data Science':             'tech',
+    'Tech Support Engineering': 'tech',
+    'UI/UX':                    'tech',
+    'DevOps / SRE':             'tech',
+    'None-Tech':                'non-tech',
+}
 
 # --- DEFINITIVE FIX: Robust Column Name Mapping ---
 # This dictionary maps potential messy column names (after being lowercased) 

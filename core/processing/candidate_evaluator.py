@@ -177,7 +177,17 @@ def evaluate_and_triage_candidates(manatal_df, quilgo_df, integrity_df, get_manu
         if not tests_with_scores:
             analyzed_quizzes = sorted([t for t in MASTER_TEST_CONFIG if t in downloaded_tests])
             print("  - No test submissions found for this candidate."); candidate_eval['roles']['No Submission'] = {'status': 'NO SUBMISSION', 'tests': [], 'analyzed_quizzes': analyzed_quizzes}; all_candidates_eval_data.append(candidate_eval); continue
-        for role, tests_for_role in active_roles.items():
+        # Only evaluate roles belonging to the same pipeline as this candidate.
+        # Tech candidates (Manatal job 2619874) → tech roles only.
+        # Non-tech candidates (Manatal job 3635455) → None-Tech role only.
+        candidate_job_category = str(row.get('job_category') or 'tech')
+        candidate_active_roles = {
+            role: tests
+            for role, tests in active_roles.items()
+            if ROLE_TO_CATEGORY_MAPPING.get(role, 'tech') == candidate_job_category
+        }
+        print(f"  [Pipeline] job_category={candidate_job_category!r} → evaluating {len(candidate_active_roles)} role(s): {', '.join(candidate_active_roles) or 'none'}")
+        for role, tests_for_role in candidate_active_roles.items():
             print(f"\n--- Evaluating Role: {role} ---")
             role_category = ROLE_TO_CATEGORY_MAPPING.get(role, 'tech')
             role_eval = {'status': 'FAIL', 'tests': [], 'manual_review_reasons': []}
@@ -196,6 +206,7 @@ def evaluate_and_triage_candidates(manatal_df, quilgo_df, integrity_df, get_manu
                 # Non-tech: scores are logged but never trigger a fail — integrity is the only disqualifier
                 print(f"  [Scoring] Category: non-tech. Scores logged only (no threshold). Passing scores: {passing_scores_count}. Proceeding to integrity check...")
             is_flagged_for_review = False
+            is_auto_failed_integrity = False
             for test_name in tests_for_role:
                 if pd.notna(row.get(test_name)):
                     score = row.get(test_name)
@@ -207,13 +218,31 @@ def evaluate_and_triage_candidates(manatal_df, quilgo_df, integrity_df, get_manu
                     if not integrity_df.empty:
                         integrity_issues = integrity_df[(integrity_df['email'] == row['email']) & (integrity_df['test_name'] == test_name)]
                         if not integrity_issues.empty:
-                            issue_text = integrity_issues.iloc[0]['Issue_Types']; is_flagged_for_review = True; reason = f"{test_name}: has integrity flags: {issue_text}"
-                            role_eval['manual_review_reasons'].append(reason); test_status += " (Integrity Flags)"; print(f"    [Integrity] Flag found for test '{test_name}': {issue_text}")
+                            issue_text = integrity_issues.iloc[0]['Issue_Types']
+                            is_tab_auto_fail = bool(integrity_issues.iloc[0].get('flag_auto_fail_switch', False))
+                            role_eval['manual_review_reasons'].append(f"{test_name}: {issue_text}")
+                            if is_tab_auto_fail:
+                                is_auto_failed_integrity = True
+                                test_status += " (Auto-Fail: Excessive Tab Switches)"
+                                print(f"    [Integrity] AUTO-FAIL on '{test_name}': {issue_text}")
+                            else:
+                                is_flagged_for_review = True
+                                test_status += " (Integrity Flags)"
+                                print(f"    [Integrity] Flag found for test '{test_name}': {issue_text}")
                     role_eval['tests'].append({'name': test_name, 'score': score, 'status': test_status})
-            if not is_flagged_for_review: print("  [Integrity] Decision: No integrity flags found.")
-            role_eval['status'] = 'MANUAL REVIEW' if is_flagged_for_review else 'QUALIFIED'
-            if is_flagged_for_review: candidate_eval['requires_manual_review'] = True
-            candidate_eval['roles'][role] = role_eval; print(f"  --> Final Status for {role}: {role_eval['status']}")
+            if not is_flagged_for_review and not is_auto_failed_integrity:
+                print("  [Integrity] Decision: No integrity flags found.")
+            if is_auto_failed_integrity:
+                role_eval['status'] = 'FAIL'
+                print(f"  --> Final Status for {role}: FAIL (Excessive Tab Switches — auto-failed)")
+            elif is_flagged_for_review:
+                role_eval['status'] = 'MANUAL REVIEW'
+                candidate_eval['requires_manual_review'] = True
+                print(f"  --> Final Status for {role}: MANUAL REVIEW")
+            else:
+                role_eval['status'] = 'QUALIFIED'
+                print(f"  --> Final Status for {role}: QUALIFIED")
+            candidate_eval['roles'][role] = role_eval
         all_candidates_eval_data.append(candidate_eval)
 
     # --- FINAL PROCESSING LOOP WITH "SKIP ALL" LOGIC ---

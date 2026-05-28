@@ -124,13 +124,24 @@ class FinalReviewView(tk.Frame):
                 continue
             # Non-tech roles skip the score threshold — fall through to integrity check
 
+            is_auto_failed = False
             is_flagged_for_review = False
             if not integrity_df.empty:
                 for test in candidate['roles'][role].get('tests', []):
                     integrity_issues = integrity_df[(integrity_df['email'] == candidate['email']) & (integrity_df['test_name'] == test['name'])]
-                    if not integrity_issues.empty: is_flagged_for_review = True; break
+                    if not integrity_issues.empty:
+                        if bool(integrity_issues.iloc[0].get('flag_auto_fail_switch', False)):
+                            is_auto_failed = True
+                            break
+                        else:
+                            is_flagged_for_review = True
 
-            candidate['roles'][role]['status'] = 'MANUAL REVIEW' if is_flagged_for_review else 'QUALIFIED'
+            if is_auto_failed:
+                candidate['roles'][role]['status'] = 'FAIL'
+            elif is_flagged_for_review:
+                candidate['roles'][role]['status'] = 'MANUAL REVIEW'
+            else:
+                candidate['roles'][role]['status'] = 'QUALIFIED'
 
         # --- Step 2: Override statuses based on the (potentially edited) manual decisions ---
         for decision in candidate.get('manual_decisions', []):

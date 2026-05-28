@@ -33,6 +33,7 @@ from core import processor
 from core.processing.quilgo_parser import (
     MASTER_TEST_CONFIG,
     ROLE_TO_TEST_MAPPING,
+    ROLE_TO_CATEGORY_MAPPING,
     SLUG_MAPPING,
     ROLE_TO_DROPDOWN_OPTION_MAP,
 )
@@ -541,8 +542,33 @@ def _reevaluate(candidate):
             # Preserve the pending state — reviewer hasn't decided yet.
             candidate["roles"][role]["status"] = "MANUAL REVIEW (Pending)"
             continue
-        passing = sum(1 for t in candidate["roles"][role].get("tests",[]) if t.get("score",0) >= 7)
-        candidate["roles"][role]["status"] = "FAIL" if passing < 2 else "QUALIFIED"
+        role_category = ROLE_TO_CATEGORY_MAPPING.get(role, 'tech')
+        passing = sum(1 for t in candidate["roles"][role].get("tests", []) if t.get("score", 0) >= 7)
+        # Tech roles: hard-fail on score threshold before integrity check
+        if role_category == 'tech' and passing < 2:
+            candidate["roles"][role]["status"] = "FAIL"
+            continue
+        # Integrity check — applies to both tech and non-tech
+        is_auto_failed = False
+        is_flagged = False
+        if not integrity_df.empty:
+            for t in candidate["roles"][role].get("tests", []):
+                issues = integrity_df[
+                    (integrity_df['email'] == candidate['email']) &
+                    (integrity_df['test_name'] == t['name'])
+                ]
+                if not issues.empty:
+                    if bool(issues.iloc[0].get('flag_auto_fail_switch', False)):
+                        is_auto_failed = True
+                        break
+                    else:
+                        is_flagged = True
+        if is_auto_failed:
+            candidate["roles"][role]["status"] = "FAIL"
+        elif is_flagged:
+            candidate["roles"][role]["status"] = "MANUAL REVIEW"
+        else:
+            candidate["roles"][role]["status"] = "QUALIFIED"
 
     for dec in candidate.get("manual_decisions",[]):
         rn, final = dec["role"], dec["decision"]
