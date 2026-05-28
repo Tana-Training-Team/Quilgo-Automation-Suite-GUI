@@ -721,10 +721,20 @@ def page_control():
     all_roles  = sorted(ROLE_TO_TEST_MAPPING.keys())
     all_quizzes = sorted(MASTER_TEST_CONFIG.keys())
 
-    # Initialise widget keys once
-    if "w_roles" not in st.session_state:
+    # Re-initialise when the available role/quiz list changes (config updates, new roles added).
+    # This ensures roles like Non-Tech are never silently absent from the selector
+    # due to a stale session that was started before the role existed.
+    _roles_fp   = ",".join(all_roles)
+    _quizzes_fp = ",".join(all_quizzes)
+    if st.session_state.get("_roles_fp") != _roles_fp:
+        st.session_state._roles_fp = _roles_fp
         st.session_state.w_roles   = all_roles[:]
-    if "w_quizzes" not in st.session_state:
+    elif "w_roles" not in st.session_state:
+        st.session_state.w_roles = all_roles[:]
+    if st.session_state.get("_quizzes_fp") != _quizzes_fp:
+        st.session_state._quizzes_fp = _quizzes_fp
+        st.session_state.w_quizzes   = all_quizzes[:]
+    elif "w_quizzes" not in st.session_state:
         st.session_state.w_quizzes = all_quizzes[:]
 
     # review_answer_box: plain dict passed to thread, written by thread, read by UI via drain
@@ -756,8 +766,20 @@ def page_control():
             st.session_state.end_date   = None
 
         st.subheader("📋 Roles & Quizzes")
-        st.multiselect("Roles", options=all_roles,
-                       key="w_roles", on_change=_roles_changed)
+        tech_roles    = [r for r in all_roles if ROLE_TO_CATEGORY_MAPPING.get(r) == 'tech']
+        nontech_roles = [r for r in all_roles if ROLE_TO_CATEGORY_MAPPING.get(r) == 'non-tech']
+        """
+        st.caption(
+            f"**Tech ({len(tech_roles)}):** {', '.join(tech_roles)}  \n"
+            f"**Non-Tech ({len(nontech_roles)}):** {', '.join('Non-Tech' if r == 'None-Tech' else r for r in nontech_roles)}"
+        )"""
+        st.multiselect(
+            "Roles",
+            options=all_roles,
+            format_func=lambda r: "Non-Tech" if r == "None-Tech" else r,
+            key="w_roles",
+            on_change=_roles_changed,
+        )
 
         qd = {q: f"{'●' if MASTER_TEST_CONFIG[q]['type']=='Required' else '○'} {q}" for q in all_quizzes}
         st.multiselect("Quizzes  (● Required  ○ Optional)",
