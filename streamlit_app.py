@@ -765,14 +765,6 @@ def page_control():
             st.session_state.start_date = None
             st.session_state.end_date   = None
 
-        st.subheader("📋 Roles & Quizzes")
-        tech_roles    = [r for r in all_roles if ROLE_TO_CATEGORY_MAPPING.get(r) == 'tech']
-        nontech_roles = [r for r in all_roles if ROLE_TO_CATEGORY_MAPPING.get(r) == 'non-tech']
-        """
-        st.caption(
-            f"**Tech ({len(tech_roles)}):** {', '.join(tech_roles)}  \n"
-            f"**Non-Tech ({len(nontech_roles)}):** {', '.join('Non-Tech' if r == 'None-Tech' else r for r in nontech_roles)}"
-        )"""
         st.multiselect(
             "Roles",
             options=all_roles,
