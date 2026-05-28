@@ -36,6 +36,7 @@ from core.processing.quilgo_parser import (
     ROLE_TO_CATEGORY_MAPPING,
     SLUG_MAPPING,
     ROLE_TO_DROPDOWN_OPTION_MAP,
+    INTERNAL_TO_QUILGO_SIDEBAR_NAME,
 )
 from core.processing.candidate_evaluator import _generate_summary_notes
 from core.processing.file_helpers import prepare_fresh_master, upsert_master_into_backup, write_manifest
@@ -238,9 +239,10 @@ def _task_playwright(q, email, password, quizzes, auto_continue,
         prepare_fresh_master(config.PROJECT_ROOT)
         q.put("✔ Prepared fresh master/ for this run.")
 
-        # Write quiz selection
+        # Write quiz selection — translate internal config keys to actual Quilgo sidebar names
+        sidebar_names = [INTERNAL_TO_QUILGO_SIDEBAR_NAME.get(q, q) for q in quizzes]
         with open(config.SELECTED_QUIZZES_FILE, "w") as f:
-            json.dump(quizzes, f)
+            json.dump(sidebar_names, f)
         q.put(f"✔ Quiz filter: {'all quizzes' if not quizzes else str(len(quizzes))+' quiz(es)'}")
 
         # Run Playwright — redirect output to a log file AND read it line by line
