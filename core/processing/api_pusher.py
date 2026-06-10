@@ -31,23 +31,24 @@ TEST_CANDIDATE_EMAILS = DEFAULT_TEST_EMAILS  # kept for backwards-compat imports
 
 
 def _load_test_settings():
-    """Return (effective_test_mode, effective_emails) by reading gui_config.ini.
+    """Return (effective_test_mode, effective_emails, freeze_stage_transitions) by reading gui_config.ini.
 
     Falls back to the hardcoded module-level defaults when the ini has no
     [push_settings] section or when the email list stored there is empty.
+    freeze_stage_transitions defaults to False (stage moves enabled) when absent.
     """
     import configparser
     try:
         from app import config as _cfg
         cfg_path = _cfg.CONFIG_FILE
     except Exception:
-        return TEST_MODE, DEFAULT_TEST_EMAILS
+        return TEST_MODE, DEFAULT_TEST_EMAILS, False
 
     p = configparser.ConfigParser(interpolation=None)
     p.read(cfg_path)
 
     if not p.has_section("push_settings"):
-        return TEST_MODE, DEFAULT_TEST_EMAILS
+        return TEST_MODE, DEFAULT_TEST_EMAILS, False
 
     s = p["push_settings"]
     mode = s.getboolean("test_mode", TEST_MODE)
@@ -56,7 +57,10 @@ def _load_test_settings():
         emails = {e.strip().lower() for e in raw.split(",") if e.strip()}
     else:
         emails = DEFAULT_TEST_EMAILS
-    return mode, emails
+    # freeze_stage_transitions = true  → stage moves skipped, all other data still pushed
+    # freeze_stage_transitions = false → normal operation, fellows are moved between stages
+    freeze = s.getboolean("freeze_stage_transitions", False)
+    return mode, emails, freeze
 
 # Stage transitions: job_category → attempt_outcome → target stage ID
 # attempt_outcome values: 'passed' | 'attempted_failed' | 'not_attempted'
@@ -86,15 +90,19 @@ STAGE_TRANSITIONS = {
 
 def execute_api_push_safely(all_candidates_df, all_profiles_raw, api_key):
     """Executes the live API push for ALL processed candidates."""
-    # Resolve test settings fresh at push time so UI changes take effect
+    # Resolve settings fresh at push time so ini changes take effect
     # without restarting the process.
-    effective_test_mode, effective_test_emails = _load_test_settings()
+    effective_test_mode, effective_test_emails, freeze_transitions = _load_test_settings()
 
     print("\n" + "="*80)
     print("🚀 COMMENCING SAFE BATCH PUSH TO MANATAL API")
     if effective_test_mode:
         print("⚠️  TEST MODE ACTIVE — only whitelisted candidates will be pushed.")
         print(f"   Whitelisted emails: {', '.join(sorted(effective_test_emails))}")
+    if freeze_transitions:
+        print("⏸  STAGE FREEZE ACTIVE — fellows will NOT be moved between stages.")
+        print("   Notes, scores, and custom fields will still be sent normally.")
+        print("   To re-enable stage moves, set freeze_stage_transitions = false in gui_config.ini.")
     print("="*80)
 
     if all_candidates_df is None or all_candidates_df.empty:
@@ -164,13 +172,22 @@ def execute_api_push_safely(all_candidates_df, all_profiles_raw, api_key):
             # Step 3: Transition the candidate's pipeline stage.
             # Correct endpoint: PATCH /matches/{match_pk}/  (not the job-scoped URL which is GET-only)
             # Correct payload:  {"stage": {"id": stage_id}}  (stage is an object, not a bare integer)
+            #
+            # The freeze_transitions flag (gui_config.ini → freeze_stage_transitions) lets you
+            # pause all stage moves temporarily — useful when verifying data before committing.
+            # Set freeze_stage_transitions = false in gui_config.ini to re-enable stage moves.
             target_stage_id = STAGE_TRANSITIONS.get(job_category, {}).get(attempt_outcome)
             if target_stage_id is not None and pd.notna(match_pk):
-                stage_payload = {"stage": {"id": target_stage_id}}
-                url = f"{BASE_URL}/matches/{int(match_pk)}/"
-                response = requests.patch(url, headers=push_headers, json=stage_payload, timeout=30)
-                response.raise_for_status()
-                print(f"  ✔ Stage updated for {name}: [{job_category}] {attempt_outcome} → stage {target_stage_id}")
+                if freeze_transitions:
+                    # Stage move deliberately skipped — fellow stays in current stage.
+                    # All other data (notes, scores, custom fields) was still sent above.
+                    print(f"  ⏸ Stage transition FROZEN for {name} ({email}): would have moved to stage {target_stage_id} [{job_category} / {attempt_outcome}]")
+                else:
+                    stage_payload = {"stage": {"id": target_stage_id}}
+                    url = f"{BASE_URL}/matches/{int(match_pk)}/"
+                    response = requests.patch(url, headers=push_headers, json=stage_payload, timeout=30)
+                    response.raise_for_status()
+                    print(f"  ✔ Stage updated for {name}: [{job_category}] {attempt_outcome} → stage {target_stage_id}")
 
             pushed_candidates.append(f"  • {name} ({email}) | {job_category} | {attempt_outcome}")
             success_count += 1

@@ -100,11 +100,11 @@ def _save_creds(email, password, api_key):
 # Push / Test-Mode settings (stored in [push_settings] of gui_config.ini)
 # ══════════════════════════════════════════════════════════════════════════════
 def _load_push_settings():
-    """Return (test_mode: bool, emails: list[str]) from ini, falling back to defaults."""
+    """Return (test_mode: bool, emails: list[str], freeze: bool) from ini, falling back to defaults."""
     p = configparser.ConfigParser(interpolation=None)
     p.read(config.CONFIG_FILE)
     if not p.has_section("push_settings"):
-        return True, sorted(DEFAULT_TEST_EMAILS)
+        return True, sorted(DEFAULT_TEST_EMAILS), False
     s = p["push_settings"]
     mode = s.getboolean("test_mode", True)
     raw = s.get("test_candidate_emails", "").strip()
@@ -112,15 +112,23 @@ def _load_push_settings():
         emails = [e.strip() for e in raw.split(",") if e.strip()]
     else:
         emails = sorted(DEFAULT_TEST_EMAILS)
-    return mode, emails
+    freeze = s.getboolean("freeze_stage_transitions", False)
+    return mode, emails, freeze
 
 
-def _save_push_settings(test_mode: bool, emails: list):
+def _save_push_settings(test_mode: bool, emails: list, freeze: bool = None):
     p = configparser.ConfigParser(interpolation=None)
     p.read(config.CONFIG_FILE)   # preserve credentials and other sections
+    # If freeze not supplied, read current value so it is never accidentally overwritten.
+    if freeze is None:
+        if p.has_section("push_settings"):
+            freeze = p["push_settings"].getboolean("freeze_stage_transitions", False)
+        else:
+            freeze = False
     p["push_settings"] = {
         "test_mode": str(test_mode).lower(),
         "test_candidate_emails": ",".join(e.strip() for e in emails if e.strip()),
+        "freeze_stage_transitions": str(freeze).lower(),
     }
     with open(config.CONFIG_FILE, "w") as f:
         p.write(f)
@@ -650,7 +658,7 @@ def page_settings():
         "Turn it OFF only when you are ready to go live."
     )
 
-    tm, te = _load_push_settings()
+    tm, te, _freeze_cur = _load_push_settings()
 
     # Toggle lives outside any form so its value drives conditional rendering.
     # Saving happens immediately on change so the push guard reflects the new
@@ -704,6 +712,38 @@ def page_settings():
             _save_push_settings(True, sorted(DEFAULT_TEST_EMAILS))
             st.success("↺ Reset to defaults.")
             st.rerun()
+
+    st.divider()
+
+    # ── Stage Transition Freeze ───────────────────────────────────────────────
+    st.subheader("⏸ Stage Transition Freeze")
+    st.caption(
+        "When **Freeze** is ON, fellows stay in the stage they were pulled from — "
+        "no stage movement happens in either pipeline (tech or non-tech). "
+        "All other data (notes, scores, custom fields) is still sent to Manatal normally. "
+        "Use this to verify what is being sent before committing to stage moves, "
+        "then flip it OFF when you are ready."
+    )
+
+    def _on_freeze_change():
+        tm_cur, te_cur, _ = _load_push_settings()
+        _save_push_settings(tm_cur, te_cur, st.session_state["f_freeze_toggle"])
+
+    _, _, freeze_val = _load_push_settings()
+    new_freeze = st.toggle(
+        "Freeze stage transitions",
+        value=freeze_val,
+        key="f_freeze_toggle",
+        on_change=_on_freeze_change,
+    )
+    if new_freeze:
+        st.warning(
+            "⏸ **Freeze ON** — stage transitions are PAUSED. "
+            "Fellows will NOT be moved between stages on the next push. "
+            "Notes, scores, and custom fields will still be sent normally."
+        )
+    else:
+        st.success("▶ **Freeze OFF** — stage transitions will run normally on the next push.")
 
     st.divider()
     st.subheader("System Setup")
@@ -791,8 +831,8 @@ def page_control():
             st.caption("No filter — all quizzes will be downloaded.")
 
         st.divider()
-        # Test Mode status badge
-        _tm, _te = _load_push_settings()
+        # Test Mode + Stage Freeze status badges
+        _tm, _te, _freeze = _load_push_settings()
         if _tm:
             st.warning(
                 f"🛡️ **Test Mode ON** — only {len(_te)} whitelisted email(s) "
@@ -801,6 +841,8 @@ def page_control():
             )
         else:
             st.success("🚀 **Test Mode OFF** — all candidates will be pushed.")
+        if _freeze:
+            st.warning("⏸ **Stage Freeze ON** — fellows will NOT be moved between stages.")
 
         st.divider()
         if st.button("⚙️ Settings", use_container_width=True, key="nav_s"):
