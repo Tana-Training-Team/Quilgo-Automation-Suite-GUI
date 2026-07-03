@@ -51,14 +51,26 @@ MASTER_TEST_CONFIG = {
 
 
 TEST_NAME_ALIASES = {
-    'Tableau': 'Data Viz: Tableau', 
-    'Power BI': 'Data Viz: PowerBI', 
-    'Looker & LookML': 'Data Viz: Looker', 
-    'OS Commands Linux': 'OS Commands: Linux', 
-    'OS Commands Windows': 'OS Commands: Windows', 
-    'Error Logs': 'Logs & Errors', 
-    'Microsoft Azure': 'Azure', 
-    'Git & CI CD': 'Git & CI/CD'
+    # Quilgo sidebar names that differ from MASTER_TEST_CONFIG keys (no filename transformation needed)
+    'Tableau':         'Data Viz: Tableau',
+    'Power BI':        'Data Viz: PowerBI',
+    'Looker & LookML': 'Data Viz: Looker',
+    'Error Logs':      'Logs & Errors',
+    'Microsoft Azure': 'Azure',
+
+    # Quilgo replaces ': ' with '_ ' in CSV filenames — colon-prefix tests
+    'Python_ General':    'Python: General',
+    'Python_ Data':       'Python: Data',
+    'OS Commands_ Linux':   'OS Commands: Linux',
+    'OS Commands_ Windows': 'OS Commands: Windows',
+
+    # Quilgo replaces '/' with '_' in CSV filenames
+    'Git & CI_CD': 'Git & CI/CD',
+
+    # Legacy space-based variants kept for backwards compatibility with older exports
+    'OS Commands Linux':  'OS Commands: Linux',
+    'OS Commands Windows': 'OS Commands: Windows',
+    'Git & CI CD':        'Git & CI/CD',
 }
 SLUG_MAPPING = {test_name: details['slug'] for test_name, details in MASTER_TEST_CONFIG.items()}
 ROLE_TO_TEST_MAPPING = {}
