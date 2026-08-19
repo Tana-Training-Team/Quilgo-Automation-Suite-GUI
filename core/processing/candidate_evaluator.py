@@ -244,6 +244,23 @@ def evaluate_and_triage_candidates(manatal_df, quilgo_df, integrity_df, get_manu
                 role_eval['status'] = 'QUALIFIED'
                 print(f"  --> Final Status for {role}: QUALIFIED")
             candidate_eval['roles'][role] = role_eval
+
+        # Give every non-manual-review role a decision record up front, agreeing
+        # with the automatic outcome (Approved for QUALIFIED, Rejected for FAIL).
+        # 'automatic_outcome' lets the dashboard tell "reviewer agrees" apart from
+        # "reviewer overrode the automatic result" without a separate flag.
+        # MANUAL REVIEW roles get their entry appended later, with automatic_outcome
+        # left as None since there is no automatic answer to agree or disagree with.
+        candidate_eval['manual_decisions'] = [
+            {
+                'role': role_name,
+                'automatic_outcome': 'Qualified' if 'QUALIFIED' in role_data.get('status', 'FAIL') else 'Not Qualified',
+                'decision': 'Approved' if 'QUALIFIED' in role_data.get('status', 'FAIL') else 'Rejected',
+                'justification': '',
+            }
+            for role_name, role_data in candidate_eval['roles'].items()
+            if role_data.get('status') != 'MANUAL REVIEW'
+        ]
         all_candidates_eval_data.append(candidate_eval)
 
     # --- FINAL PROCESSING LOOP WITH "SKIP ALL" LOGIC ---
@@ -274,6 +291,7 @@ def evaluate_and_triage_candidates(manatal_df, quilgo_df, integrity_df, get_manu
                 candidate['roles'][role_name]['status'] = 'MANUAL REVIEW (Pending)'
                 candidate['manual_decisions'].append({
                     'role': role_name,
+                    'automatic_outcome': None,
                     'decision': 'Pending',
                     'justification': '',
                 })
@@ -312,6 +330,7 @@ def evaluate_and_triage_candidates(manatal_df, quilgo_df, integrity_df, get_manu
                     )
                     candidate['manual_decisions'].append({
                         'role': role_name,
+                        'automatic_outcome': None,
                         'decision': final_decision,
                         'justification': justification,
                     })
@@ -345,7 +364,13 @@ def evaluate_and_triage_candidates(manatal_df, quilgo_df, integrity_df, get_manu
             final_note_md, final_note_html = _generate_summary_notes(candidate, integrity_df, candidate.get('manual_decisions'))
             row_dict['summary_note_md'] = final_note_md
             row_dict['summary_note_html'] = final_note_html
-            qualified_roles = [role for role, data in candidate['roles'].items() if "QUALIFIED" in data.get('status', 'FAIL')]
+            # Qualification is read from the unified decision record (not the status
+            # string) so a reviewer override — either direction — is respected here.
+            decisions_by_role = {d['role']: d for d in candidate.get('manual_decisions', [])}
+            qualified_roles = [
+                role for role in candidate['roles']
+                if decisions_by_role.get(role, {}).get('decision') == 'Approved'
+            ]
             scores_payload = {slug: row_dict.get(test) for test, slug in SLUG_MAPPING.items() if pd.notna(row_dict.get(test))}
             scores_payload['techtestspassed'] = [ROLE_TO_DROPDOWN_OPTION_MAP.get(r, r) for r in qualified_roles] if qualified_roles else ["FAIL: Did not meet minimum requirements"]
             row_dict['scores_to_update'] = json.dumps(scores_payload)

@@ -580,22 +580,64 @@ def _reevaluate(candidate):
         else:
             candidate["roles"][role]["status"] = "QUALIFIED"
 
+    # Refresh 'automatic_outcome' on every non-pending, auto-decided role to track
+    # the status just recomputed above — but never touch the reviewer's own
+    # 'decision'/'justification'. A role with no entry yet (shouldn't normally
+    # happen, but defensive for older cached data) gets a fresh agreeing default,
+    # the same way the evaluator seeds it on the first pass.
+    decisions_by_role = {d["role"]: d for d in candidate.get("manual_decisions", [])}
+    for role, role_data in candidate["roles"].items():
+        if role == "No Submission" or role in pending_roles:
+            continue
+        status = role_data.get("status", "FAIL")
+        if "MANUAL REVIEW" in status:
+            continue  # unresolved manual-review role — no automatic outcome to track
+        auto_outcome = "Qualified" if "QUALIFIED" in status else "Not Qualified"
+        entry = decisions_by_role.get(role)
+        if entry is None:
+            entry = {
+                "role": role, "automatic_outcome": auto_outcome,
+                "decision": "Approved" if auto_outcome == "Qualified" else "Rejected",
+                "justification": "",
+            }
+            candidate.setdefault("manual_decisions", []).append(entry)
+            decisions_by_role[role] = entry
+        elif entry.get("automatic_outcome") is not None:
+            # Only auto-decided roles track a moving automatic_outcome — a
+            # genuinely manual-reviewed role (automatic_outcome=None) stays None.
+            entry["automatic_outcome"] = auto_outcome
+
+    # Re-stamp the role status with "(Manually Approved/Rejected)" ONLY when the
+    # reviewer's decision is notable — either a genuine manual-review resolution
+    # (automatic_outcome is None) or an override of an auto-decided role. A role
+    # where the reviewer simply agrees with the automatic outcome keeps its plain
+    # QUALIFIED/FAIL status, with no decision to record.
     for dec in candidate.get("manual_decisions",[]):
-        rn, final = dec["role"], dec["decision"]
+        rn, final = dec["role"], dec.get("decision")
         if rn not in candidate["roles"]: continue
         if final == "Pending":
             # Skip — the role status is already "MANUAL REVIEW (Pending)",
             # and there is no such thing as "QUALIFIED (Manually Pending)".
             continue
+        auto = dec.get("automatic_outcome")
+        agrees = (
+            (auto == "Qualified" and final == "Approved") or
+            (auto == "Not Qualified" and final == "Rejected")
+        )
+        if agrees:
+            continue
         if final in ("Approved", "Rejected"):
             candidate["roles"][rn]["status"] = (
-                f"QUALIFIED (Manually {final})" if final == "Approved"
-                else f"FAIL (Manually {final})"
+                "QUALIFIED (Manually Approved)" if final == "Approved"
+                else "FAIL (Manually Rejected)"
             )
     md, html = _generate_summary_notes(candidate, integrity_df, candidate.get("manual_decisions"))
     candidate["original_row"]["summary_note_md"]   = md
     candidate["original_row"]["summary_note_html"] = html
-    qr = [r for r,d in candidate["roles"].items() if "QUALIFIED" in d.get("status","FAIL")]
+    # Qualification is read straight from the decision record so an override in
+    # either direction (auto-qualified rejected, or auto-failed accepted) flows
+    # through to what gets pushed to Manatal.
+    qr = [r for r in candidate["roles"] if decisions_by_role.get(r, {}).get("decision") == "Approved"]
     row = candidate["original_row"]
     sp = {slug: row.get(test) for test,slug in SLUG_MAPPING.items() if pd.notna(row.get(test))}
     sp["techtestspassed"] = ([ROLE_TO_DROPDOWN_OPTION_MAP.get(r,r) for r in qr]
@@ -1135,14 +1177,41 @@ def _rl(role: str) -> str:
     return 'Non-Tech' if role == 'None-Tech' else role
 
 
+def _is_notable_decision(d):
+    """
+    True when a role's decision record represents something a reviewer
+    actually did — an unresolved Pending, a genuine manual-review resolution
+    (automatic_outcome is None), or an override of an auto-decided role.
+
+    False when the reviewer simply agrees with the automatic outcome — every
+    auto-qualified/auto-failed role carries a decision record now, but a
+    silent agreement shouldn't read as "manual activity" anywhere in the UI
+    (summary counts, filters, or the collapse-approved view).
+    """
+    if d.get("decision") == "Pending":
+        return True
+    auto = d.get("automatic_outcome")
+    if auto is None:
+        return True  # resolved manual-review role
+    agrees = (
+        (auto == "Qualified" and d.get("decision") == "Approved") or
+        (auto == "Not Qualified" and d.get("decision") == "Rejected")
+    )
+    return not agrees
+
+
 def _final_status(cand):
     # A candidate with any Pending decision is neither APPROVED nor REJECTED
     # yet — they're PENDING and can't be pushed to Manatal until resolved.
     if _has_pending(cand):
         return "PENDING", []
-    q = {r for r,d in cand["roles"].items() if "QUALIFIED" in d.get("status","FAIL")}
-    a = {d["role"] for d in cand.get("manual_decisions",[]) if d["decision"]=="Approved"}
-    all_q = sorted(q|a)
+    # Every role now carries a decision record (auto-decided or manually
+    # reviewed), so it alone is the single source of truth for qualification —
+    # this also means an override in either direction is respected here.
+    all_q = sorted({
+        d["role"] for d in cand.get("manual_decisions", [])
+        if d.get("decision") == "Approved"
+    })
     return ("APPROVED" if all_q else "REJECTED"), all_q
 
 # Scoring rule used on the dashboard. Keep in sync with candidate_evaluator.py:
@@ -1169,7 +1238,9 @@ def _candidate_matches_filters(cand, status, qroles, f):
     if f["status"] == "Approved" and status != "APPROVED": return False
     if f["status"] == "Rejected" and status != "REJECTED": return False
     if f["status"] == "Pending review" and status != "PENDING": return False
-    if f["status"] == "Has manual decision" and not cand.get("manual_decisions"): return False
+    if f["status"] == "Has manual decision" and not any(
+        _is_notable_decision(d) for d in cand.get("manual_decisions", [])
+    ): return False
 
     # Role filter — match against roles the candidate was EVALUATED for, not
     # only the ones they qualified for; otherwise rejected candidates vanish
@@ -1252,7 +1323,8 @@ def page_final_review():
     approved = sum(1 for s, _ in status_cache if s == "APPROVED")
     rejected = sum(1 for s, _ in status_cache if s == "REJECTED")
     # pending_count computed earlier (needed by the push guard)
-    manual   = sum(1 for c in results if c.get("manual_decisions"))
+    manual   = sum(1 for c in results
+                   if any(_is_notable_decision(d) for d in c.get("manual_decisions", [])))
     empty_sc = sum(1 for c in results if _has_empty_score(c))
 
     m1, m2, m3, m4, m5, m6 = st.columns(6)
@@ -1355,7 +1427,7 @@ def page_final_review():
         if status == "APPROVED":  icon = "🟢"
         elif status == "PENDING": icon = "⏳"
         else:                     icon = "🔴"
-        has_manual  = bool(cand.get("manual_decisions"))
+        has_manual  = any(_is_notable_decision(d) for d in cand.get("manual_decisions", []))
         has_empty   = _has_empty_score(cand)
         has_pending = _has_pending(cand)
 
@@ -1604,36 +1676,78 @@ def page_final_review():
                     st.markdown("---")
 
             if resolved_decs:
-                if pending_decs:
-                    st.markdown("### Previously-resolved decisions")
+                st.markdown("### Role Decisions")
+                st.caption(
+                    "Every role has a decision here. Auto-qualified/auto-failed roles "
+                    "start pre-filled agreeing with the automatic result — change the "
+                    "decision to override it. A justification is only required when "
+                    "the decision disagrees with the automatic result (or for a "
+                    "genuine manual-review role, same as before)."
+                )
                 for (j, dec) in resolved_decs:
                     rn = dec.get("role", "N/A")
+                    auto = dec.get("automatic_outcome")
                     d1, d2 = st.columns([1, 2])
                     with d1:
                         nd = st.selectbox(
-                            f"Decision '{rn}'", ["Approved", "Rejected"],
+                            f"Decision '{_rl(rn)}'", ["Approved", "Rejected"],
                             index=0 if dec.get("decision") == "Approved" else 1,
                             key=f"dec_{i}_{j}",
                         )
+                        if auto is not None:
+                            st.caption(f"Automatic result: {auto}")
                     with d2:
+                        overriding = auto is not None and not (
+                            (auto == "Qualified" and nd == "Approved") or
+                            (auto == "Not Qualified" and nd == "Rejected")
+                        )
+                        just_label = f"Justification '{_rl(rn)}'"
+                        if auto is None or overriding:
+                            just_label += "  (required)"
                         nj2 = st.text_area(
-                            f"Justification '{rn}'",
+                            just_label,
                             value=dec.get("justification", ""),
                             height=80, key=f"just_{i}_{j}",
                         )
+                        if overriding:
+                            st.caption("⚠ Overrides the automatic result.")
                     edited["manual_decisions"][j]["decision"]      = nd
                     edited["manual_decisions"][j]["justification"] = nj2
 
             if st.button("💾 Save & Re-evaluate", key=f"save_{i}"):
-                try:
-                    _apply_score_edits(edited, score_inp)
-                    edited = _reevaluate(edited)
-                    st.session_state.final_results[i] = edited
-                    st.success("✅ Saved."); st.rerun()
-                except ValueError:
-                    st.error("Scores must be numbers.")
-                except Exception as e:
-                    st.error(str(e))
+                # Justification is required whenever a decision disagrees with the
+                # automatic result, and always for a genuine manual-review role
+                # (automatic_outcome is None) — same rule as the Pending flow above.
+                # Roles still Pending are skipped here; they're resolved via their
+                # own Approve/Reject buttons, not this Save action.
+                missing_justification = []
+                for dec in edited.get("manual_decisions", []):
+                    if dec.get("decision") == "Pending":
+                        continue
+                    auto = dec.get("automatic_outcome")
+                    agrees = (
+                        (auto == "Qualified" and dec.get("decision") == "Approved") or
+                        (auto == "Not Qualified" and dec.get("decision") == "Rejected")
+                    )
+                    requires_justification = auto is None or not agrees
+                    if requires_justification and not (dec.get("justification") or "").strip():
+                        missing_justification.append(dec.get("role", "?"))
+
+                if missing_justification:
+                    st.error(
+                        "Justification required for: "
+                        + ", ".join(_rl(r) for r in missing_justification)
+                    )
+                else:
+                    try:
+                        _apply_score_edits(edited, score_inp)
+                        edited = _reevaluate(edited)
+                        st.session_state.final_results[i] = edited
+                        st.success("✅ Saved."); st.rerun()
+                    except ValueError:
+                        st.error("Scores must be numbers.")
+                    except Exception as e:
+                        st.error(str(e))
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Router
