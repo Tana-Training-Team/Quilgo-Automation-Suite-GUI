@@ -147,6 +147,30 @@ def _html_escape(s: str) -> str:
     """Escape for safe embedding inside a <div>…</div> block."""
     return _html.escape(s or "", quote=False)
 
+def _copyable_email_html(email: str) -> str:
+    """
+    Render an email as clickable text that copies itself to the clipboard,
+    with a brief '✓ copied' confirmation. Falls back to plain escaped text
+    for missing/placeholder values (nothing useful to copy).
+    """
+    email = email or "N/A"
+    if email in ("N/A", ""):
+        return _html_escape(email)
+    # json.dumps gives a JS-safe double-quoted string; escape any stray single
+    # quote too since the HTML attribute itself is single-quoted below.
+    js_literal = json.dumps(email).replace("'", "\\u0027")
+    label = _html_escape(email)
+    return (
+        "<span style='display:inline-flex;align-items:center;gap:6px;'>"
+        f"<span onclick='navigator.clipboard.writeText({js_literal}).then(()=>{{"
+        "const c=this.nextElementSibling; c.style.opacity=1; clearTimeout(c._t); "
+        "c._t=setTimeout(()=>c.style.opacity=0,1200);})' "
+        "style='cursor:pointer;text-decoration:underline dotted;' "
+        f"title='Click to copy'>{label}</span>"
+        "<span style='opacity:0;transition:opacity .3s;color:#059669;font-size:11px;'>✓ copied</span>"
+        "</span>"
+    )
+
 def _prune_old_logs():
     """Delete session log files older than LOG_RETENTION_DAYS. Best-effort — never raises."""
     try:
@@ -1082,7 +1106,7 @@ def _render_review():
 
     st.warning(f"⚠️ Manual Review {pr['review_num']} of {pr['total_reviews']}")
     st.subheader(f"👤 {c.get('full_name','N/A')}")
-    st.caption(f"📧 {c.get('email','N/A')}")
+    st.markdown(f"📧 {_copyable_email_html(c.get('email','N/A'))}", unsafe_allow_html=True)
 
     role_data = c.get("roles",{}).get(pr["role_name"],{})
     reasons   = role_data.get("manual_review_reasons", [])
@@ -1443,7 +1467,7 @@ def page_final_review():
                 f"<div style='padding:8px 12px;border:1px solid #e5e7eb;"
                 f"border-radius:6px;margin-bottom:6px;'>"
                 f"{icon} <b>{_html_escape(cand.get('full_name','N/A'))}</b> "
-                f"<span style='color:#6b7280;'>· {_html_escape(cand.get('email','N/A'))}</span> "
+                f"<span style='color:#6b7280;'>· {_copyable_email_html(cand.get('email','N/A'))}</span> "
                 f"<span style='color:#059669;'>· Qualified for: "
                 f"{_html_escape(roles_line)}</span>"
                 f"</div>",
@@ -1477,6 +1501,8 @@ def page_final_review():
             #   3. "Full breakdown" expander (open by default) — per-role
             #      status icon + status, then per-test `name: score | status`
             # Nothing else.
+
+            st.markdown(f"📧 {_copyable_email_html(cand.get('email','N/A'))}", unsafe_allow_html=True)
 
             if qroles: st.success("Qualified for: " + ", ".join(_rl(r) for r in qroles))
             else:      st.error("Did not meet requirements for any role.")
