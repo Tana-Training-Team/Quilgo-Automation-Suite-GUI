@@ -557,6 +557,12 @@ def _drain():
 # Re-evaluate candidate after score edit
 # ══════════════════════════════════════════════════════════════════════════════
 def _reevaluate(candidate):
+    # No Submission candidates have nothing to score. Leave them exactly as the
+    # evaluator produced them, otherwise re-evaluating would replace the
+    # "No Submission" note and push payload with a generic failed evaluation.
+    if candidate.get("roles", {}).get("No Submission"):
+        return candidate
+
     integrity_df = processor.get_cached_integrity_df()
 
     # Roles that currently have a Pending manual decision MUST keep their
@@ -1238,6 +1244,46 @@ def _final_status(cand):
     })
     return ("APPROVED" if all_q else "REJECTED"), all_q
 
+
+def _role_rejection_reason(rdata, dec):
+    """Why a rejected role was rejected: 'manual', 'integrity' or 'score'."""
+    auto = (dec or {}).get("automatic_outcome")
+    if auto != "Not Qualified":
+        # None → resolved manual-review role; "Qualified" → reviewer overrode a pass.
+        return "manual"
+    if any("Auto-Fail" in str(t.get("status", "")) for t in rdata.get("tests", [])):
+        return "integrity"
+    return "score"
+
+
+def _rejection_reason_text(kind):
+    return {
+        "manual":    "rejected by reviewer",
+        "integrity": "auto-failed on integrity (excessive tab switches)",
+        "score":     f"fewer than {MIN_PASSING_TESTS} tests scored ≥ {PASS_THRESHOLD}",
+    }[kind]
+
+
+def _rejection_outcome(cand):
+    """
+    Split a REJECTED candidate into the message the dashboard shows:
+      'not_attempted' — no submission for any assessed quiz
+      'failed'        — attempted, and every role failed on score alone
+      'not_met'       — anything else (integrity auto-fail, reviewer
+                        rejection, or a mix of reasons)
+    Returns (kind, [(role, reason_text), ...]).
+    """
+    roles = cand.get("roles", {}) or {}
+    if "No Submission" in roles:
+        return "not_attempted", []
+    decs = {d.get("role"): d for d in cand.get("manual_decisions", [])}
+    reasons = [(rn, _role_rejection_reason(rd, decs.get(rn)))
+               for rn, rd in roles.items()
+               if decs.get(rn, {}).get("decision") != "Approved"]
+    kinds = {k for _, k in reasons}
+    kind = "failed" if kinds == {"score"} else "not_met"
+    return kind, [(rn, _rejection_reason_text(k)) for rn, k in reasons]
+
 # Scoring rule used on the dashboard. Keep in sync with candidate_evaluator.py:
 #   A role qualifies when the candidate has >= MIN_PASSING_TESTS test scores
 #   that are >= PASS_THRESHOLD.
@@ -1485,7 +1531,13 @@ def page_final_review():
         expand_default = (status in ("REJECTED", "PENDING")
                           or has_manual or has_empty)
 
-        header = (f"{icon} **{cand.get('full_name','N/A')}** — {status}  |  "
+        # Rejected candidates get a more specific label so "did not attempt"
+        # and "failed" aren't lumped together under one generic REJECTED.
+        rej_kind, rej_reasons = (_rejection_outcome(cand) if status == "REJECTED"
+                                 else (None, []))
+        status_label = {"not_attempted": "DID NOT ATTEMPT",
+                        "failed": "FAILED"}.get(rej_kind, status)
+        header = (f"{icon} **{cand.get('full_name','N/A')}** — {status_label}  |  "
                   f"{cand.get('email','N/A')}")
 
         with st.expander(header + flag_suffix, expanded=expand_default):
@@ -1504,8 +1556,24 @@ def page_final_review():
 
             st.markdown(f"📧 {_copyable_email_html(cand.get('email','N/A'))}", unsafe_allow_html=True)
 
-            if qroles: st.success("Qualified for: " + ", ".join(_rl(r) for r in qroles))
-            else:      st.error("Did not meet requirements for any role.")
+            if qroles:
+                st.success("Qualified for: " + ", ".join(_rl(r) for r in qroles))
+            elif status == "PENDING":
+                pending_roles = [d.get("role") for d in cand.get("manual_decisions", [])
+                                 if d.get("decision") == "Pending"]
+                st.info("Awaiting review — decision pending for: "
+                        + ", ".join(_rl(r) for r in pending_roles))
+            elif rej_kind == "not_attempted":
+                st.warning("Did not attempt — no submissions found for any of the "
+                           "assessed quizzes.")
+            else:
+                if rej_kind == "failed":
+                    st.error(f"Failed — did not reach the passing score "
+                             f"({MIN_PASSING_TESTS} tests ≥ {PASS_THRESHOLD}) for any role.")
+                else:
+                    st.error("Did not meet requirements for any role.")
+                if rej_reasons:
+                    st.caption(" · ".join(f"{_rl(rn)}: {why}" for rn, why in rej_reasons))
 
             # (2) Integrity flags — same filter the overlay uses:
             #     only reasons whose text contains "integrity".

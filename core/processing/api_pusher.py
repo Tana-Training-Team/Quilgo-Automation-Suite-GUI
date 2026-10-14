@@ -6,6 +6,7 @@ import time
 import sys
 from tqdm import tqdm
 import pandas as pd
+from .http_retry import request_with_retry, REQUEST_DELAY_SECONDS
 
 BASE_URL = "https://api.manatal.com/open/v3"
 
@@ -152,8 +153,7 @@ def execute_api_push_safely(all_candidates_df, all_profiles_raw, api_key):
 
                 final_merged_payload = {"custom_fields": existing_custom_fields}
                 url = f"{BASE_URL}/candidates/{candidate_id}/"
-                response = requests.patch(url, headers=push_headers, json=final_merged_payload, timeout=30)
-                response.raise_for_status()
+                request_with_retry('PATCH', url, headers=push_headers, json=final_merged_payload, timeout=30)
 
             # Step 2: Add a new summary note to the match.
             # We always POST (create) — existing notes are never patched or deleted.
@@ -166,8 +166,10 @@ def execute_api_push_safely(all_candidates_df, all_profiles_raw, api_key):
                     print(f"  ℹ️  {name}: existing note (ID {int(existing_note_id)}) preserved — adding new Quilgo note alongside it.")
                 note_payload = {"info": note_html_content}
                 url = f"{BASE_URL}/matches/{int(match_pk)}/notes/"
-                response = requests.post(url, headers=push_headers, json=note_payload, timeout=30)
-                response.raise_for_status()
+                # Retry only on 429: a timed-out POST may already have created the
+                # note, and retrying it would add a duplicate.
+                request_with_retry('POST', url, headers=push_headers, json=note_payload,
+                                   timeout=30, retry_transient_errors=False)
 
             # Step 3: Transition the candidate's pipeline stage.
             # Correct endpoint: PATCH /matches/{match_pk}/  (not the job-scoped URL which is GET-only)
@@ -185,13 +187,12 @@ def execute_api_push_safely(all_candidates_df, all_profiles_raw, api_key):
                 else:
                     stage_payload = {"stage": {"id": target_stage_id}}
                     url = f"{BASE_URL}/matches/{int(match_pk)}/"
-                    response = requests.patch(url, headers=push_headers, json=stage_payload, timeout=30)
-                    response.raise_for_status()
+                    request_with_retry('PATCH', url, headers=push_headers, json=stage_payload, timeout=30)
                     print(f"  ✔ Stage updated for {name}: [{job_category}] {attempt_outcome} → stage {target_stage_id}")
 
             pushed_candidates.append(f"  • {name} ({email}) | {job_category} | {attempt_outcome}")
             success_count += 1
-            time.sleep(0.5)
+            time.sleep(REQUEST_DELAY_SECONDS)
         except requests.exceptions.RequestException as e:
             # e.response is falsy for 4xx/5xx — use 'is not None' to access the body
             if getattr(e, 'response', None) is not None:

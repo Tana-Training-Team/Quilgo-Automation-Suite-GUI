@@ -174,19 +174,30 @@ def evaluate_and_triage_candidates(manatal_df, quilgo_df, integrity_df, get_manu
     for _, row in merged_df.iterrows():
         print(f"\n------------------ Evaluating Candidate: {row['full_name']} ({row['email']}) ------------------")
         candidate_eval = {'email': row['email'], 'full_name': row['full_name'], 'original_row': row.to_dict(), 'roles': {}, 'requires_manual_review': False}
+        candidate_job_category = str(row.get('job_category') or 'tech')
         tests_with_scores = [test for test in MASTER_TEST_CONFIG if pd.notna(row.get(test))]
-        if not tests_with_scores:
+        # "No Submission" applies to the tech pipeline only. Non-tech quizzes are
+        # optional, so a non-tech candidate with no quizzes is evaluated normally
+        # below and passes (integrity flags are the only non-tech disqualifier).
+        if not tests_with_scores and candidate_job_category != 'non-tech':
             analyzed_quizzes = sorted([t for t in MASTER_TEST_CONFIG if t in downloaded_tests])
             print("  - No test submissions found for this candidate."); candidate_eval['roles']['No Submission'] = {'status': 'NO SUBMISSION', 'tests': [], 'analyzed_quizzes': analyzed_quizzes}; all_candidates_eval_data.append(candidate_eval); continue
         # Only evaluate roles belonging to the same pipeline as this candidate.
-        # Tech candidates (Manatal job 2619874) → tech roles only.
-        # Non-tech candidates (Manatal job 3635455) → None-Tech role only.
-        candidate_job_category = str(row.get('job_category') or 'tech')
+        # Tech candidates (Manatal job 2619874) → tech roles whose tests were downloaded.
+        # Non-tech candidates (Manatal job 3635455) → None-Tech role, ALWAYS — even
+        # when none of its quizzes were downloaded this run. Otherwise the candidate
+        # ends up with no role at all and is pushed as attempted_failed.
+        if candidate_job_category == 'non-tech':
+            role_pool = ROLE_TO_TEST_MAPPING
+        else:
+            role_pool = active_roles
         candidate_active_roles = {
             role: tests
-            for role, tests in active_roles.items()
+            for role, tests in role_pool.items()
             if ROLE_TO_CATEGORY_MAPPING.get(role, 'tech') == candidate_job_category
         }
+        if candidate_job_category == 'non-tech' and not tests_with_scores:
+            print("  - No quizzes taken (optional for non-tech) — passes unless flagged.")
         print(f"  [Pipeline] job_category={candidate_job_category!r} → evaluating {len(candidate_active_roles)} role(s): {', '.join(candidate_active_roles) or 'none'}")
         for role, tests_for_role in candidate_active_roles.items():
             print(f"\n--- Evaluating Role: {role} ---")
