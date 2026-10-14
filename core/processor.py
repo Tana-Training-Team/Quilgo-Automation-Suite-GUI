@@ -7,7 +7,7 @@ import pandas as pd
 from app import config # Import the main app config for paths
 
 # Import from our new, refactored modules
-from .processing.manatal_fetcher import fetch_manatal_profiles
+from .processing.manatal_fetcher import fetch_manatal_profiles, ManatalFetchIncomplete
 from .processing.quilgo_parser import ingest_and_analyze_quilgo_data
 from .processing.candidate_evaluator import evaluate_and_triage_candidates
 from .processing.file_helpers import get_master_folder, create_final_audit_backups
@@ -105,6 +105,11 @@ def run_or_rerun_processing(use_cache, api_key, project_root, get_manual_review_
             get_manual_review_decision, start_date=start_date, end_date=end_date
         )
 
+    except ManatalFetchIncomplete as e:
+        # Raised before the cache is saved, so a partial list never reaches the
+        # cache, the dashboard or the push.
+        print(f"\n❌ Part 2 stopped: {e}")
+        return [], False
     except Exception as e:
         print(f"\n❌ A critical error occurred during Python processing: {e}")
         traceback.print_exc()
