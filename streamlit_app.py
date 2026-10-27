@@ -1119,6 +1119,8 @@ def _store_draft(run_id, key, saved):
     when a widget is redrawn after a save, and putting a value back the way
     it was should clear the "unsaved draft" marker.
     """
+    if key not in st.session_state:   # widget already gone (e.g. decision just saved)
+        return
     value = st.session_state[key]
     if _same_value(value, saved):
         store.clear_drafts(run_id, [key])
@@ -1127,13 +1129,14 @@ def _store_draft(run_id, key, saved):
 
 
 def _commit_candidate(i, cand, ck, run_id):
-    """Save a decided/edited candidate and drop its drafts and widget state."""
+    """Save a decided/edited candidate and drop its drafts."""
     _save_candidate(i, cand)
     marker = f"_{ck}_"
-    stale = [k for k in list(st.session_state.keys()) if marker in str(k)]
-    store.clear_drafts(run_id, stale + [k for k in store.load_drafts(run_id) if marker in k])
-    for k in stale:
-        st.session_state.pop(k, None)
+    # Widget state is deliberately left alone: deleting a widget's key while
+    # Streamlit is still handling it crashes the next on_change (KeyError) when
+    # reviewers click quickly. The widgets already hold the saved values, and a
+    # resolved Pending decision's box disappears on the redraw anyway.
+    store.clear_drafts(run_id, [k for k in store.load_drafts(run_id) if marker in k])
 
 
 @st.dialog("Push to Manatal?")
