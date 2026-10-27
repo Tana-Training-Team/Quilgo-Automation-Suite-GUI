@@ -2,22 +2,26 @@
 streamlit_app.py — Quilgo Automation Suite (Web UI)
 
 Architecture:
-  - st.session_state holds ALL persistent state (survives reruns).
-  - Background threads receive the queue/event as plain Python objects
-    passed at launch — they never touch st.session_state.
-  - The UI polls every 1 s via st.rerun() while a task is running.
+  - Results and reviewer decisions live on disk (app/results_store.py), not in
+    st.session_state, so a refresh, a closed tab, a dropped connection or a
+    container restart loses nothing. Every edit is saved immediately; text that
+    is typed but not yet saved is kept as a draft.
+  - Tasks (Part 1, Part 2, push) run in one background runner owned by the
+    server process (app/task_runner.py). Every page and every tab sees the same
+    status and log, and only one task can run at a time.
+  - The live log refreshes inside a fragment, so only the log panel re-renders
+    while a task runs — not the whole page.
+  - st.session_state only holds per-tab view state (current page, filters).
 """
 
 import streamlit as st
 import configparser
 import subprocess
-import threading
 import sys
 import os
 import html as _html
 import logging
 import json
-import queue
 import time
 import copy
 import datetime
@@ -29,6 +33,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from app import config
+from app import results_store as store
+from app.task_runner import runner, LOG_RETENTION_DAYS
 from core import processor
 from core.processing.quilgo_parser import (
     MASTER_TEST_CONFIG,
@@ -51,32 +57,75 @@ st.set_page_config(
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Session state initialisation
-# All mutable state lives here — persists across reruns for this browser tab.
+# Per-tab view state
+# Only things that are fine to lose on refresh live here (and even the current
+# page survives a refresh through the URL). Everything that matters is on disk.
 # ══════════════════════════════════════════════════════════════════════════════
+PAGES = ("settings", "control", "final_review")
+
+# Widgets whose values should survive switching pages. Streamlit deletes a
+# widget's state when the widget isn't rendered (i.e. you're on another page);
+# re-assigning the key to itself on every run keeps it.
+_PERSISTENT_WIDGET_DEFAULTS = {
+    "w_use_dates": False, "w_start": None, "w_end": None, "w_auto": True,
+    "fr_f_status": "All", "fr_f_roles": [], "fr_f_search": "",
+    "fr_f_sort": "Pending first", "fr_f_empty": False, "fr_f_collapse_happy": True,
+}
+
 def _init():
+    for k, v in _PERSISTENT_WIDGET_DEFAULTS.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+        else:
+            st.session_state[k] = st.session_state[k]
+    # Role/quiz selections: defaults are set by the Control Panel, just keep them.
+    for k in ("w_roles", "w_quizzes"):
+        if k in st.session_state:
+            st.session_state[k] = st.session_state[k]
     if "ready" in st.session_state:
         return
     st.session_state.ready          = True
-    st.session_state.page           = "settings"
-    st.session_state.log_lines      = []
-    st.session_state.log_queue      = queue.Queue()   # thread → UI
-    st.session_state.task_running   = False
-    st.session_state.task_name      = ""
-    st.session_state.task_start     = 0.0
+    st.session_state.page           = st.query_params.get("page", "control")
+    if st.session_state.page not in PAGES:
+        st.session_state.page = "control"
     st.session_state.final_results  = []
+    st.session_state.results_run_id = None
+    st.session_state.results_version = None
     st.session_state.confirm_push   = False
-    # manual review handshake objects
-    st.session_state.review_event   = threading.Event()
-    st.session_state.review_pending = None   # dict | None
-    st.session_state.review_answer  = None   # tuple | None
-    # filters
-    st.session_state.start_date     = None
-    st.session_state.end_date       = None
-    # path to the current run's log file on disk (None when no run has started yet)
-    st.session_state.current_log_file = None
+    st.session_state.confirm_replace = None   # task name awaiting "replace results?" confirm
+    st.session_state.awaiting_run_id = None   # run this tab started and will follow to Final Review
 
 _init()
+
+
+def _go(page):
+    """Switch page and keep it in the URL, so a refresh lands on the same page."""
+    st.session_state.page = page
+    st.query_params["page"] = page
+    st.rerun()
+
+
+def _sync_results():
+    """
+    Load results from disk when the file has changed since this tab last
+    read it — after Part 2 finishes, after a refresh, or after another tab
+    saved an edit.
+    """
+    v = store.version()
+    if v == st.session_state.results_version:
+        return
+    run = store.load()
+    st.session_state.final_results  = run.get("candidates", [])
+    st.session_state.results_run_id = run.get("run_id")
+    st.session_state.results_version = v
+
+
+def _save_candidate(i, cand):
+    """Persist one edited candidate and update this tab's copy."""
+    store.update_candidate(cand)
+    st.session_state.final_results[i] = cand
+    st.session_state.results_version = store.version()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Credentials
@@ -135,14 +184,8 @@ def _save_push_settings(test_mode: bool, emails: list, freeze: bool = None):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# File-based session logs
-#   • Each task run gets its own log file under downloads/logs/
-#   • Log lines are appended as they arrive (streaming from the start of the run)
-#   • Files older than LOG_RETENTION_DAYS are pruned at launch
+# HTML helpers
 # ══════════════════════════════════════════════════════════════════════════════
-LOGS_DIR = config.DOWNLOADS_DIR / "logs"
-LOG_RETENTION_DAYS = 3
-
 def _html_escape(s: str) -> str:
     """Escape for safe embedding inside a <div>…</div> block."""
     return _html.escape(s or "", quote=False)
@@ -171,387 +214,208 @@ def _copyable_email_html(email: str) -> str:
         "</span>"
     )
 
-def _prune_old_logs():
-    """Delete session log files older than LOG_RETENTION_DAYS. Best-effort — never raises."""
-    try:
-        if not LOGS_DIR.exists():
-            return
-        cutoff = time.time() - LOG_RETENTION_DAYS * 86400
-        for f in LOGS_DIR.glob("session_*.log"):
-            try:
-                if f.stat().st_mtime < cutoff:
-                    f.unlink()
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-def _new_log_file(task_name: str) -> Path | None:
-    """Create a fresh log file for a run; returns its path (or None on failure)."""
-    try:
-        LOGS_DIR.mkdir(parents=True, exist_ok=True)
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe = "".join(c if c.isalnum() else "_" for c in (task_name or "task"))
-        path = LOGS_DIR / f"session_{ts}_{safe}.log"
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(f"# Quilgo Automation Suite — session log\n")
-            f.write(f"# Task: {task_name}\n")
-            f.write(f"# Started: {datetime.datetime.now().isoformat(timespec='seconds')}\n")
-            f.write("#" + "─" * 60 + "\n")
-        return path
-    except Exception:
-        return None
-
-def _append_log_file(line: str):
-    """Append one line to the active session log file. Best-effort — never raises."""
-    path = st.session_state.get("current_log_file")
-    if not path:
-        return
-    try:
-        ts = datetime.datetime.now().strftime("%H:%M:%S")
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(f"[{ts}] {line}\n")
-    except Exception:
-        pass
-
 # ══════════════════════════════════════════════════════════════════════════════
-# stdout → queue writer  (used inside threads as sys.stdout replacement)
+# stdout → task log (used inside the worker thread)
 # ══════════════════════════════════════════════════════════════════════════════
-class _QWriter:
+class _LogWriter:
     """
-    Stream-like object that forwards every write to a queue line-by-line.
+    Stream-like object that forwards every write to the task log line-by-line.
     Treats BOTH '\\n' and '\\r' as line terminators, so tqdm/progress bars
-    (which use carriage returns to rewrite the same line) are visible in the
-    Streamlit log in real time instead of being buffered forever.
+    (which use carriage returns to rewrite the same line) show up live.
     """
-    def __init__(self, q):
-        self.q, self.buf = q, ""
+    def __init__(self, emit):
+        self.emit, self.buf = emit, ""
     def write(self, t):
         if not t:
             return
-        # Normalise CR → LF so progress-bar updates appear as fresh lines.
-        # (We intentionally keep each CR-segment as its own log line.)
         self.buf += t.replace("\r\n", "\n").replace("\r", "\n")
         while "\n" in self.buf:
             line, self.buf = self.buf.split("\n", 1)
-            self.q.put(line)
+            self.emit(line)
     def flush(self):
         if self.buf:
-            self.q.put(self.buf); self.buf = ""
-    # Make isatty/fileno failures non-fatal for libs that probe the stream
+            self.emit(self.buf); self.buf = ""
     def isatty(self): return False
 
+
+class _capture_output:
+    """Send print(), stderr and the logging module to the task log for the duration."""
+    def __init__(self, emit):
+        self.writer = _LogWriter(emit)
+    def __enter__(self):
+        self.orig = (sys.stdout, sys.stderr)
+        sys.stdout = sys.stderr = self.writer
+        self.handler = logging.StreamHandler(self.writer)
+        self.handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+        root = logging.getLogger()
+        self.prev_level = root.level
+        root.addHandler(self.handler)
+        if self.prev_level > logging.INFO or self.prev_level == logging.NOTSET:
+            root.setLevel(logging.INFO)
+        return self
+    def __exit__(self, *exc):
+        try: self.writer.flush()
+        except Exception: pass
+        sys.stdout, sys.stderr = self.orig
+        root = logging.getLogger()
+        root.removeHandler(self.handler)
+        root.setLevel(self.prev_level)
+        return False
+
 # ══════════════════════════════════════════════════════════════════════════════
-# Background task functions
-# All arguments are plain Python objects captured at thread-launch time.
-# NEVER read st.session_state inside these functions.
+# Background tasks
+# Run by app.task_runner in a server-owned thread. Each receives `emit` (append
+# a line to the shared log) and plain arguments captured at launch, returns
+# True on success, and NEVER touches st.session_state — the tab that started
+# it may be long gone by the time it finishes.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _task_playwright(q, email, password, quizzes, auto_continue,
-                     sd, ed, api_key, review_event, review_answer_box):
-    q.put("━"*50)
-    q.put("▶ Part 1 thread started")
-    q.put("━"*50)
-    env_file  = config.PROJECT_ROOT / ".env"
-    log_file  = config.PROJECT_ROOT / "playwright_live.log"
+def _task_playwright(emit, email, password, quizzes, auto_continue, sd, ed, api_key):
+    emit("━"*50); emit("▶ Part 1 started"); emit("━"*50)
+    env_file = config.PROJECT_ROOT / ".env"
     try:
-        # Credentials check
         if not email or not password:
-            q.put("❌ ERROR: Quilgo credentials not found. Go to Settings first.")
-            return
+            emit("❌ ERROR: Quilgo credentials not found. Go to Settings first.")
+            return False
+        emit(f"✔ Credentials found for: {email}")
 
-        q.put(f"✔ Credentials found for: {email}")
-
-        # Write .env
         with open(env_file, "w") as f:
             f.write(f'QUILGO_EMAIL="{email}"\nQUILGO_PASSWORD="{password}"\n')
-        q.put("✔ .env file written")
+        emit("✔ .env file written")
 
         # Clear master so Playwright writes into a clean directory
         prepare_fresh_master(config.PROJECT_ROOT)
-        q.put("✔ Prepared fresh master/ for this run.")
+        emit("✔ Prepared fresh master/ for this run.")
 
         # Write quiz selection — translate internal config keys to actual Quilgo sidebar names
-        sidebar_names = [INTERNAL_TO_QUILGO_SIDEBAR_NAME.get(q, q) for q in quizzes]
+        sidebar_names = [INTERNAL_TO_QUILGO_SIDEBAR_NAME.get(qz, qz) for qz in quizzes]
         with open(config.SELECTED_QUIZZES_FILE, "w") as f:
             json.dump(sidebar_names, f)
-        q.put(f"✔ Quiz filter: {'all quizzes' if not quizzes else str(len(quizzes))+' quiz(es)'}")
+        emit(f"✔ Quiz filter: {'all quizzes' if not quizzes else str(len(quizzes))+' quiz(es)'}")
 
-        # Run Playwright — redirect output to a log file AND read it line by line
-        cmd = f"npx playwright test --browser chromium 2>&1 | tee {log_file}"
-        q.put(f"▶ Running: npx playwright test --browser chromium")
-        q.put(f"  Working dir: {config.PROJECT_ROOT}")
+        emit("▶ Running: npx playwright test --browser chromium")
+        emit(f"  Working dir: {config.PROJECT_ROOT}")
 
-        # Force unbuffered output from child processes so log lines stream live
-        # instead of arriving in big chunks. Merging stderr into stdout preserves
-        # chronological order (which is how a real terminal shows them).
+        # Unbuffered, uncoloured output so log lines stream live and readable.
         child_env = os.environ.copy()
-        child_env["PYTHONUNBUFFERED"] = "1"
-        child_env["FORCE_COLOR"] = "0"      # strip ANSI colour escapes
-        child_env["NO_COLOR"] = "1"
-        child_env["CI"] = "1"               # Playwright prints plain progress under CI
-
+        child_env.update(PYTHONUNBUFFERED="1", FORCE_COLOR="0", NO_COLOR="1", CI="1")
         npx_cmd = "npx.cmd" if sys.platform == "win32" else "npx"
         proc = subprocess.Popen(
             [npx_cmd, "playwright", "test", "--browser", "chromium"],
             cwd=str(config.PROJECT_ROOT),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,       # merge so order is preserved
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,                      # line-buffered
-            env=child_env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,   # merged keeps order
+            text=True, encoding="utf-8", errors="replace", bufsize=1, env=child_env,
         )
-
-        # Read char-by-char so both '\n' and '\r' terminate a line.
-        # Playwright (and tqdm-style tools) use '\r' to rewrite a progress line;
-        # readline() would block until the final '\n', hiding live progress.
-        def _pipe(stream):
-            buf = []
-            try:
-                while True:
-                    ch = stream.read(1)
-                    if ch == "":
-                        break
-                    if ch in ("\n", "\r"):
-                        line = "".join(buf).rstrip()
-                        buf.clear()
-                        if line:
-                            q.put(line)
-                    else:
-                        buf.append(ch)
-                if buf:
-                    tail = "".join(buf).rstrip()
-                    if tail:
-                        q.put(tail)
-            finally:
-                try: stream.close()
-                except Exception: pass
-
-        t_out = threading.Thread(target=_pipe, args=(proc.stdout,), daemon=True)
-        t_out.start()
-        t_out.join()
+        # Read char-by-char so both '\n' and '\r' end a line — Playwright
+        # rewrites progress lines with '\r', which readline() would hide.
+        buf = []
+        while True:
+            ch = proc.stdout.read(1)
+            if ch == "":
+                break
+            if ch in ("\n", "\r"):
+                line = "".join(buf).rstrip(); buf.clear()
+                if line: emit(line)
+            else:
+                buf.append(ch)
+        if buf and "".join(buf).strip():
+            emit("".join(buf).rstrip())
         proc.wait()
+        emit(f"[Playwright exit code: {proc.returncode}]")
 
-        q.put(f"[Playwright exit code: {proc.returncode}]")
+        if proc.returncode != 0:
+            emit("❌ Part 1 FAILED — see output above for details.")
+            return False
 
-        if proc.returncode == 0:
+        with _capture_output(emit):
             new_rows = upsert_master_into_backup(config.PROJECT_ROOT)
             write_manifest(config.PROJECT_ROOT, stats_by_file=new_rows)
-            q.put("✔✔✔ Part 1 COMPLETED successfully!")
-            if auto_continue:
-                q.put("━"*50)
-                q.put("▶ Auto-continuing to Part 2…")
-                q.put("━"*50)
-                _task_processor_inner(q, False, sd, ed, api_key, review_event, review_answer_box)
-        else:
-            q.put("❌ Part 1 FAILED — see output above for details.")
+        emit("✔✔✔ Part 1 COMPLETED successfully!")
+        if not auto_continue:
+            return True
+        emit("━"*50); emit("▶ Auto-continuing to Part 2…"); emit("━"*50)
+        return _task_processor(emit, False, sd, ed, api_key)
     except FileNotFoundError as e:
-        q.put(f"❌ Command not found: {e}")
-        q.put("  Make sure Node.js and npx are installed in the container.")
-        q.put("  Try: Go to Settings → Run System Setup")
-    except Exception as e:
-        q.put(f"❌ EXCEPTION in Part 1: {e}")
-        q.put(traceback.format_exc())
+        emit(f"❌ Command not found: {e}")
+        emit("  Make sure Node.js and npx are installed in the container.")
+        emit("  Try: Go to Settings → Run System Setup")
+        return False
     finally:
         try:
             if env_file.exists(): env_file.unlink()
             if config.SELECTED_QUIZZES_FILE.exists(): config.SELECTED_QUIZZES_FILE.unlink()
-            if log_file.exists(): log_file.unlink()
         except Exception as ex:
-            q.put(f"[cleanup error] {ex}")
-        q.put("__TASK_RUNNING_FALSE__")
+            emit(f"[cleanup error] {ex}")
 
 
-def _task_processor_inner(q, use_cache, sd, ed, api_key, review_event, review_answer_box):
-    q.put("[thread] Part 2 processor started")
-    # Capture EVERYTHING the processor emits — print(), sys.stderr.write(),
-    # and the `logging` module — so the Task Log mirrors the terminal exactly.
-    orig_out, orig_err = sys.stdout, sys.stderr
-    writer = _QWriter(q)
-    sys.stdout = writer
-    sys.stderr = writer
-    log_handler = logging.StreamHandler(writer)
-    log_handler.setLevel(logging.DEBUG)
-    log_handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
-    root_logger = logging.getLogger()
-    prev_level = root_logger.level
-    root_logger.addHandler(log_handler)
-    if prev_level > logging.INFO or prev_level == logging.NOTSET:
-        root_logger.setLevel(logging.INFO)
-    try:
-        if not api_key:
-            q.put("ERROR: Manatal API Key not found. Go to Settings first."); return
-        q.put("="*60); q.put("Starting Part 2: Data Processor…"); q.put("="*60)
+def _task_processor(emit, use_cache, sd, ed, api_key):
+    if not api_key:
+        emit("❌ ERROR: Manatal API Key not found. Go to Settings first.")
+        return False
+    emit("="*60); emit("Starting Part 2: Data Processor…"); emit("="*60)
 
-        # ── Manual review handling ────────────────────────────────────────
-        # All manual-review cases are now resolved on the Final Review
-        # dashboard instead of via the mid-run overlay. This callback
-        # unconditionally returns "skip", which the evaluator now treats as
-        # "defer this role to the dashboard as Pending" (it used to DROP the
-        # candidate entirely — that was a real bug).
-        #
-        # The original synchronous overlay code (commented below) is kept
-        # for reference so we can flip back with a one-line change if
-        # needed. `_render_review` in the UI is also left in place.
-        def get_decision(candidate_data, role_name, review_num, total_reviews):
-            q.put(f"  ⏳ Deferring '{role_name}' for {candidate_data.get('full_name','?')} "
-                  f"to the Final Review dashboard.")
-            return ("skip", "")
+    # Every manual-review case is resolved on the Final Review dashboard, so
+    # the evaluator defers each one as "Pending".
+    def get_decision(candidate_data, role_name, review_num, total_reviews):
+        emit(f"  ⏳ Deferring '{role_name}' for {candidate_data.get('full_name','?')} "
+             f"to the Final Review dashboard.")
+        return ("skip", "")
 
-        # --- Legacy synchronous overlay (disabled) ---
-        # def get_decision(candidate_data, role_name, review_num, total_reviews):
-        #     review_answer_box["answer"] = None
-        #     review_answer_box["pending"] = {
-        #         "candidate_data": candidate_data,
-        #         "role_name": role_name,
-        #         "review_num": review_num,
-        #         "total_reviews": total_reviews,
-        #     }
-        #     q.put("__REVIEW_NEEDED__")
-        #     review_event.clear()
-        #     review_event.wait()
-        #     result = review_answer_box["answer"]
-        #     review_answer_box["pending"] = None
-        #     return result
-
+    with _capture_output(emit):
         results, success = processor.run_or_rerun_processing(
             use_cache=use_cache, api_key=api_key,
             project_root=config.PROJECT_ROOT,
             get_manual_review_decision=get_decision,
             start_date=sd, end_date=ed,
         )
-        if success:
-            review_answer_box["final_results"] = results
-            q.put("✔✔✔ Part 2 COMPLETED successfully!"); q.put("__SHOW_FINAL__")
-        else:
-            q.put("❌ Part 2 FAILED."); q.put("__DONE__")
-    except Exception as e:
-        q.put(f"ERROR in Part 2: {e}"); q.put(traceback.format_exc()); q.put("__DONE__")
-    finally:
-        try: writer.flush()
-        except Exception: pass
-        sys.stdout = orig_out
-        sys.stderr = orig_err
-        try:
-            root_logger.removeHandler(log_handler)
-            root_logger.setLevel(prev_level)
-        except Exception:
-            pass
+    if not success:
+        emit("❌ Part 2 FAILED.")
+        return False
+    # Saved by the task itself, so the results survive even if nobody has the
+    # page open when Part 2 finishes.
+    store.save_new_run(results, processor.get_cached_integrity_df(), "Part 2")
+    emit(f"✔ {len(results)} candidate(s) saved for Final Review.")
+    emit("✔✔✔ Part 2 COMPLETED successfully!")
+    return True
 
 
-def _task_processor(q, use_cache, sd, ed, api_key, review_event, review_answer_box):
-    try:
-        _task_processor_inner(q, use_cache, sd, ed, api_key, review_event, review_answer_box)
-    except Exception as e:
-        q.put(f"EXCEPTION in Part 2 wrapper: {e}")
-        q.put(traceback.format_exc())
-    finally:
-        q.put("__TASK_RUNNING_FALSE__")
-
-
-def _task_api_push(q, api_key, final_results_snapshot):
+def _task_api_push(emit, api_key, final_results_snapshot):
     """
-    Push the final results to Manatal.
-
-    `final_results_snapshot` is a plain-Python list of candidate dicts,
-    captured at launch time from `st.session_state.final_results`. We rebuild
-    the push cache from this snapshot BEFORE calling `trigger_api_push` so
-    the API ships the dashboard-edited data, not the stale Part 2 output.
-    (See `processor.refresh_push_cache_from_results` for details.)
+    Push the final results to Manatal. `final_results_snapshot` is the
+    dashboard's (edited) candidate list captured at launch; the push cache is
+    rebuilt from it so Manatal gets the edited data, not the raw Part 2 output.
     """
-    orig_out, orig_err = sys.stdout, sys.stderr
-    writer = _QWriter(q)
-    sys.stdout = writer
-    sys.stderr = writer
-    log_handler = logging.StreamHandler(writer)
-    log_handler.setLevel(logging.DEBUG)
-    log_handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
-    root_logger = logging.getLogger()
-    prev_level = root_logger.level
-    root_logger.addHandler(log_handler)
-    if prev_level > logging.INFO or prev_level == logging.NOTSET:
-        root_logger.setLevel(logging.INFO)
-    try:
-        if not api_key:
-            q.put("ERROR: Manatal API Key not found."); q.put("__DONE__"); return
-        q.put("="*60); q.put("Starting API Push…"); q.put("="*60)
-
-        # Sync dashboard edits into the push cache. If the snapshot is empty
-        # (nothing edited, no final_results in session), the existing cache
-        # from Part 2 is preserved — same behaviour as before.
+    if not api_key:
+        emit("❌ ERROR: Manatal API Key not found.")
+        return False
+    emit("="*60); emit("Starting API Push…"); emit("="*60)
+    with _capture_output(emit):
         try:
             n = processor.refresh_push_cache_from_results(final_results_snapshot)
-            if n:
-                q.put(f"✔ Push cache synced with {n} dashboard-edited candidate(s).")
-            else:
-                q.put("ℹ No dashboard edits to sync — using Part 2 output as-is.")
+            print(f"✔ Push cache synced with {n} dashboard candidate(s)." if n
+                  else "ℹ No dashboard results to sync — using Part 2 output as-is.")
         except Exception as sync_err:
-            # Don't let a sync failure block the push — log and continue with
-            # whatever is already in the cache. That preserves the previous
-            # behaviour if something goes wrong with reassembly.
-            q.put(f"⚠ Could not sync dashboard edits into push cache: {sync_err}")
-            q.put(traceback.format_exc())
-
+            # Don't block the push — fall back to whatever is already cached.
+            print(f"⚠ Could not sync dashboard edits into push cache: {sync_err}")
+            traceback.print_exc()
         ok = processor.trigger_api_push(api_key)
-        q.put("✔✔✔ API Push COMPLETED." if ok else "❌ API Push FAILED.")
-        q.put("__DONE__")
-    except Exception as e:
-        q.put(f"ERROR in API Push: {e}"); q.put("__DONE__")
-    finally:
-        try: writer.flush()
-        except Exception: pass
-        sys.stdout = orig_out
-        sys.stderr = orig_err
-        try:
-            root_logger.removeHandler(log_handler)
-            root_logger.setLevel(prev_level)
-        except Exception:
-            pass
-        q.put("__TASK_RUNNING_FALSE__")
+    if ok:
+        store.mark_pushed()
+        emit("✔✔✔ API Push COMPLETED.")
+    else:
+        emit("❌ API Push FAILED.")
+    return ok
 
 
-def _launch(target, args):
-    """Mark task as running, clear log, start daemon thread."""
-    st.session_state.task_running  = True
-    st.session_state.task_start    = time.time()
-    st.session_state.log_lines     = []
-    # drain any stale items from a previous run
-    while not st.session_state.log_queue.empty():
-        try: st.session_state.log_queue.get_nowait()
-        except: pass
-    # Prune >3-day-old session logs, then open a fresh log file for this run
-    _prune_old_logs()
-    st.session_state.current_log_file = _new_log_file(st.session_state.get("task_name", "task"))
-    threading.Thread(target=target, args=args, daemon=True).start()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Drain queue + handle control signals
-# ══════════════════════════════════════════════════════════════════════════════
-def _drain():
-    """Pull everything from the queue into session_state. Returns True if page should change."""
-    q = st.session_state.log_queue
-    navigate = None
-    while True:
-        try:
-            line = q.get_nowait()
-        except queue.Empty:
-            break
-        if line == "__TASK_RUNNING_FALSE__":
-            st.session_state.task_running = False
-        elif line == "__SHOW_FINAL__":
-            box = st.session_state.get("review_answer_box", {})
-            st.session_state.final_results = box.get("final_results", [])
-            navigate = "final_review"
-        elif line == "__REVIEW_NEEDED__":
-            box = st.session_state.get("review_answer_box", {})
-            st.session_state.review_pending = box.get("pending")
-        else:
-            st.session_state.log_lines.append(line)
-            _append_log_file(line)
-    return navigate
+def _start_task(name, target, *args, follow_to_final=False):
+    """Start a task on the shared runner; tell the user if one is already running."""
+    run_id = runner.start(name, target, *args)
+    if run_id is None:
+        st.session_state["_start_error"] = (
+            f"⚠ {runner.snapshot()['name']} is already running — wait for it to finish.")
+    else:
+        st.session_state.awaiting_run_id = run_id if follow_to_final else None
+    return run_id
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Re-evaluate candidate after score edit
@@ -563,7 +427,10 @@ def _reevaluate(candidate):
     if candidate.get("roles", {}).get("No Submission"):
         return candidate
 
-    integrity_df = processor.get_cached_integrity_df()
+    # From disk, not processor memory: after a restart the in-memory copy is
+    # empty, and re-evaluating without the flags would turn flagged roles into
+    # QUALIFIED.
+    integrity_df = store.load_integrity_df()
 
     # Roles that currently have a Pending manual decision MUST keep their
     # "MANUAL REVIEW (Pending)" status through re-evaluation. If we let the
@@ -720,7 +587,7 @@ def page_settings():
         st.success("✅ Credentials saved!")
     if go:
         _save_creds(ne, np_, nk)
-        st.session_state.page = "control"; st.rerun()
+        _go("control")
 
     st.divider()
     st.subheader("🛡️ Test Mode Guard")
@@ -831,66 +698,131 @@ def page_settings():
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE: Control Panel
 # ══════════════════════════════════════════════════════════════════════════════
+def _fmt_elapsed(seconds):
+    s = max(0, int(seconds))
+    return f"{s//60:02d}:{s%60:02d}"
+
+
+def _selected_dates():
+    """(start, end) as UTC timestamps, or None when the date filter is off."""
+    if not st.session_state.w_use_dates:
+        return None, None
+    sv, ev = st.session_state.w_start, st.session_state.w_end
+    sd = pd.Timestamp(sv, tz="UTC") if isinstance(sv, datetime.date) else None
+    ed = pd.Timestamp(ev, tz="UTC") if isinstance(ev, datetime.date) else None
+    return sd, ed
+
+
+def _launch_requested(name, all_quizzes):
+    """Start the task the user clicked (after any confirmation)."""
+    email, password, api_key = _load_creds()
+    sd, ed = _selected_dates()
+    if name == "Part 1":
+        quizzes = st.session_state.w_quizzes
+        if set(quizzes) == set(all_quizzes):
+            quizzes = []
+        auto = st.session_state.w_auto
+        _start_task("Part 1", _task_playwright, email, password, quizzes, auto, sd, ed, api_key,
+                    follow_to_final=auto)
+    elif name == "Part 2":
+        _start_task("Part 2", _task_processor, False, sd, ed, api_key, follow_to_final=True)
+    elif name == "Part 2 (cache)":
+        _start_task("Part 2", _task_processor, True, sd, ed, api_key, follow_to_final=True)
+
+
+def _request_task(name, all_quizzes):
+    """
+    A new Part 2 replaces the current Final Review results. If reviewers have
+    edited them since the last push, ask first instead of silently throwing
+    that work away (the previous run is still kept in results_prev.json).
+    """
+    replaces_results = name != "Part 1" or st.session_state.w_auto
+    if replaces_results and store.has_unpushed_edits():
+        st.session_state.confirm_replace = name
+    else:
+        _launch_requested(name, all_quizzes)
+    st.rerun()
+
+
+@st.fragment(run_every=1.0)
+def _live_log(rendered_run_id, rendered_running):
+    """
+    Live task log. Runs on its own every second, so only this panel
+    re-renders while a task runs — the rest of the page (and anything being
+    typed in it) is left alone.
+    """
+    snap = runner.snapshot()
+    if (snap["run_id"], snap["running"]) != (rendered_run_id, rendered_running):
+        # A task started or finished since the page was drawn: redraw the whole
+        # page so buttons and status match (and follow to Final Review).
+        st.rerun()
+
+    if snap["running"]:
+        st.info(f"⏳ **{snap['name']} is running…**  ⏱ "
+                f"{_fmt_elapsed(time.time() - snap['started_at'])}  ·  "
+                "You can leave this page or close the tab — the task keeps running "
+                "and its results are saved.")
+    elif snap["run_id"]:
+        took = _fmt_elapsed(snap["finished_at"] - snap["started_at"])
+        if snap["succeeded"]:
+            st.success(f"✅ {snap['name']} finished successfully ({took}).")
+        else:
+            st.error(f"❌ {snap['name']} failed after {took} — see the log below.")
+
+    TAIL = 800   # lines rendered; the full log is in the file on disk
+    visible, total = runner.tail(TAIL)
+    log_text = "\n".join(visible) if visible else "(no task has run yet)"
+    # column-reverse keeps the scroll position pinned to the newest line
+    # without JavaScript (scripts inside st.markdown don't run).
+    st.markdown(
+        f"""<div style="height:420px; overflow-y:auto; display:flex;
+                flex-direction:column-reverse; padding:10px;
+                background:#0e1117; color:#e6edf3;
+                border:1px solid #30363d; border-radius:6px;
+                font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+                font-size:12px;"><div style="white-space:pre-wrap; word-break:break-word;">{_html_escape(log_text)}</div></div>""",
+        unsafe_allow_html=True,
+    )
+    if total > TAIL:
+        st.caption(f"Showing last {TAIL} of {total} lines · full log in the download below")
+
+
 def page_control():
     all_roles  = sorted(ROLE_TO_TEST_MAPPING.keys())
     all_quizzes = sorted(MASTER_TEST_CONFIG.keys())
 
     # Re-initialise when the available role/quiz list changes (config updates, new roles added).
-    # This ensures roles like Non-Tech are never silently absent from the selector
-    # due to a stale session that was started before the role existed.
-    _roles_fp   = ",".join(all_roles)
-    _quizzes_fp = ",".join(all_quizzes)
-    if st.session_state.get("_roles_fp") != _roles_fp:
+    _roles_fp, _quizzes_fp = ",".join(all_roles), ",".join(all_quizzes)
+    if st.session_state.get("_roles_fp") != _roles_fp or "w_roles" not in st.session_state:
         st.session_state._roles_fp = _roles_fp
         st.session_state.w_roles   = all_roles[:]
-    elif "w_roles" not in st.session_state:
-        st.session_state.w_roles = all_roles[:]
-    if st.session_state.get("_quizzes_fp") != _quizzes_fp:
+    if st.session_state.get("_quizzes_fp") != _quizzes_fp or "w_quizzes" not in st.session_state:
         st.session_state._quizzes_fp = _quizzes_fp
         st.session_state.w_quizzes   = all_quizzes[:]
-    elif "w_quizzes" not in st.session_state:
-        st.session_state.w_quizzes = all_quizzes[:]
 
-    # review_answer_box: plain dict passed to thread, written by thread, read by UI via drain
-    if "review_answer_box" not in st.session_state:
-        st.session_state.review_answer_box = {}
-
-    # ── on_change: roles → quizzes sync ──────────────────────────────────────
     def _roles_changed():
-        roles = st.session_state.w_roles
         derived = []
-        for r in roles:
+        for r in st.session_state.w_roles:
             for qz in ROLE_TO_TEST_MAPPING.get(r, []):
                 if qz not in derived: derived.append(qz)
         st.session_state.w_quizzes = derived if derived else all_quizzes[:]
 
-    # ── Sidebar ───────────────────────────────────────────────────────────────
+    # ── Sidebar filters ───────────────────────────────────────────────────────
     with st.sidebar:
         st.header("🔧 Filters")
-
         st.subheader("📅 Date Range")
-        use_dates = st.checkbox("Filter by submission date", key="w_use_dates")
-        if use_dates:
-            sv = st.session_state.start_date if isinstance(st.session_state.start_date, datetime.date) else None
-            ev = st.session_state.end_date   if isinstance(st.session_state.end_date,   datetime.date) else None
-            st.session_state.start_date = st.date_input("From", value=sv, key="w_start")
-            st.session_state.end_date   = st.date_input("To",   value=ev, key="w_end")
-        else:
-            st.session_state.start_date = None
-            st.session_state.end_date   = None
+        if st.checkbox("Filter by submission date", key="w_use_dates"):
+            st.date_input("From", key="w_start")
+            st.date_input("To",   key="w_end")
 
         st.multiselect(
-            "Roles",
-            options=all_roles,
+            "Roles", options=all_roles,
             format_func=lambda r: "Non-Tech" if r == "None-Tech" else r,
-            key="w_roles",
-            on_change=_roles_changed,
+            key="w_roles", on_change=_roles_changed,
         )
-
         qd = {q: f"{'●' if MASTER_TEST_CONFIG[q]['type']=='Required' else '○'} {q}" for q in all_quizzes}
         st.multiselect("Quizzes  (● Required  ○ Optional)",
-                       options=all_quizzes, format_func=lambda q: qd[q],
-                       key="w_quizzes")
+                       options=all_quizzes, format_func=lambda q: qd[q], key="w_quizzes")
 
         active = st.session_state.w_quizzes
         if active and set(active) != set(all_quizzes):
@@ -902,264 +834,95 @@ def page_control():
         else:
             st.caption("No filter — all quizzes will be downloaded.")
 
-        st.divider()
-        # Test Mode + Stage Freeze status badges
-        _tm, _te, _freeze = _load_push_settings()
-        if _tm:
-            st.warning(
-                f"🛡️ **Test Mode ON** — only {len(_te)} whitelisted email(s) "
-                f"will be pushed.",
-                icon=None,
-            )
-        else:
-            st.success("🚀 **Test Mode OFF** — all candidates will be pushed.")
-        if _freeze:
-            st.warning("⏸ **Stage Freeze ON** — fellows will NOT be moved between stages.")
-
-        st.divider()
-        if st.button("⚙️ Settings", use_container_width=True, key="nav_s"):
-            st.session_state.page = "settings"; st.rerun()
-        if st.session_state.final_results:
-            if st.button("📊 Final Review", use_container_width=True, key="nav_f"):
-                st.session_state.page = "final_review"; st.rerun()
-
-    # ── Manual review overlay ─────────────────────────────────────────────────
-    if st.session_state.review_pending:
-        _render_review(); return
-
-    # Drain queue FIRST — before reading task_running so signals update state
-    navigate = _drain()
-    if navigate:
-        st.session_state.page = navigate
-        st.rerun()
-
     # ── Header ────────────────────────────────────────────────────────────────
-    running = st.session_state.task_running
-    elapsed = ""
-    if running:
-        s = int(time.time() - st.session_state.task_start)
-        elapsed = f"  ⏱ {s//60:02d}:{s%60:02d}"
-    st.title(f"🎯 Control Panel{elapsed}")
+    snap = runner.snapshot()
+    running = snap["running"]
+    st.title("🎯 Control Panel")
 
-    # ── Status banner ─────────────────────────────────────────────────────────
-    if running:
-        st.info(f"⏳ **{st.session_state.task_name} is running…** Log updates every second.")
-    elif st.session_state.log_lines:
-        last = st.session_state.log_lines[-1]
-        if "✔✔✔" in last:
-            st.success(last)
-        elif "❌" in last or "ERROR" in last or "EXCEPTION" in last:
-            st.error(last)
-        else:
-            st.success("✅ Task finished.")
+    err = st.session_state.pop("_start_error", None)
+    if err:
+        st.error(err)
 
-    auto_cont = st.checkbox("Run Part 2 automatically after successful Part 1",
-                            value=True, key="w_auto")
+    # ── "Replace unpushed review work?" confirmation ─────────────────────────
+    pending_task = st.session_state.confirm_replace
+    if pending_task and not running:
+        run = store.load()
+        with st.container(border=True):
+            st.warning(
+                f"⚠ **{pending_task} will replace the current Final Review results** "
+                f"({len(run.get('candidates', []))} candidates), which have review edits "
+                "that have **not been pushed to Manatal** yet. "
+                "The current results are kept as a backup (downloads/state/results_prev.json), "
+                "but they will no longer be shown on the dashboard."
+            )
+            k1, k2, _ = st.columns([1, 1, 3])
+            if k1.button("Yes, replace them", type="primary", key="cr_yes"):
+                st.session_state.confirm_replace = None
+                _launch_requested(pending_task, all_quizzes)
+                st.rerun()
+            if k2.button("Cancel", key="cr_no"):
+                st.session_state.confirm_replace = None
+                st.rerun()
+
+    st.checkbox("Run Part 2 automatically after successful Part 1", key="w_auto")
 
     # ── Buttons ───────────────────────────────────────────────────────────────
-    c1, c2, c3 = st.columns(3)
-
-    quilgo_ready = config.QUILGO_RUNS_DIR.exists() and any(config.QUILGO_RUNS_DIR.iterdir())
+    quilgo_ready = (config.QUILGO_MASTER_DIR.exists()
+                    and any(config.QUILGO_MASTER_DIR.glob("*.csv")))
     cache_ready  = config.MANATAL_CACHE_FILE.exists()
 
+    c1, c2, c3 = st.columns(3)
     with c1:
-        if st.button("▶ Run Downloader (Part 1)",
-                     disabled=running, type="primary",
+        if st.button("▶ Run Downloader (Part 1)", disabled=running, type="primary",
                      use_container_width=True, key="btn_p1"):
-            email, password, api_key = _load_creds()
-            quizzes = st.session_state.w_quizzes
-            if set(quizzes) == set(all_quizzes): quizzes = []
-            sd = pd.Timestamp(st.session_state.start_date, tz="UTC") if st.session_state.start_date else None
-            ed = pd.Timestamp(st.session_state.end_date,   tz="UTC") if st.session_state.end_date   else None
-            st.session_state.task_name = "Part 1"
-            _launch(_task_playwright, args=(
-                st.session_state.log_queue, email, password, quizzes,
-                auto_cont, sd, ed, api_key,
-                st.session_state.review_event,
-                st.session_state.review_answer_box,
-            ))
-            st.rerun()
-
+            _request_task("Part 1", all_quizzes)
     with c2:
-        if st.button("▶ Run Processor (Part 2)",
-                     disabled=(running or not quilgo_ready),
+        if st.button("▶ Run Processor (Part 2)", disabled=(running or not quilgo_ready),
                      type="primary", use_container_width=True, key="btn_p2",
                      help="Run Part 1 first to download Quilgo data"):
-            _, _, api_key = _load_creds()
-            sd = pd.Timestamp(st.session_state.start_date, tz="UTC") if st.session_state.start_date else None
-            ed = pd.Timestamp(st.session_state.end_date,   tz="UTC") if st.session_state.end_date   else None
-            st.session_state.task_name = "Part 2"
-            _launch(_task_processor, args=(
-                st.session_state.log_queue, False, sd, ed, api_key,
-                st.session_state.review_event,
-                st.session_state.review_answer_box,
-            ))
-            st.rerun()
-
+            _request_task("Part 2", all_quizzes)
     with c3:
-        if st.button("🔄 Re-run Processor (Cache)",
-                     disabled=(running or not cache_ready),
+        if st.button("🔄 Re-run Processor (Cache)", disabled=(running or not cache_ready),
                      use_container_width=True, key="btn_p2c",
                      help="Skips Manatal fetch, uses cached profiles"):
-            _, _, api_key = _load_creds()
-            sd = pd.Timestamp(st.session_state.start_date, tz="UTC") if st.session_state.start_date else None
-            ed = pd.Timestamp(st.session_state.end_date,   tz="UTC") if st.session_state.end_date   else None
-            st.session_state.task_name = "Part 2"
-            _launch(_task_processor, args=(
-                st.session_state.log_queue, True, sd, ed, api_key,
-                st.session_state.review_event,
-                st.session_state.review_answer_box,
-            ))
-            st.rerun()
+            _request_task("Part 2 (cache)", all_quizzes)
 
-    if st.session_state.final_results and not running:
-        if st.button("📊 Go to Final QA Page →", key="btn_qa"):
-            st.session_state.page = "final_review"; st.rerun()
+    if st.session_state.final_results:
+        if st.button("📊 Go to Final Review →", key="btn_qa"):
+            _go("final_review")
 
     # ── Log ───────────────────────────────────────────────────────────────────
-    lc, bc = st.columns([9,1])
+    lc, bc = st.columns([9, 1])
     with lc: st.subheader("📋 Task Log")
     with bc:
         if st.button("🗑", key="btn_clear", disabled=running, help="Clear log"):
-            st.session_state.log_lines = []; st.rerun()
+            runner.clear_log(); st.rerun()
 
-    # Render the log as a scrollable code block that auto-scrolls to the newest
-    # line every rerun — this is what gives the "live terminal" feel. We keep
-    # the full in-memory buffer (nothing is truncated) but only render the tail
-    # in the box so the DOM stays responsive on very long runs.
-    log_lines = st.session_state.log_lines
-    TAIL = 800   # lines visible in the scrollable box; full log is on disk
-    visible = log_lines[-TAIL:] if len(log_lines) > TAIL else log_lines
-    log_text = "\n".join(visible) if visible else "(waiting for output…)"
-    # Use a monospaced code block inside a fixed-height scroll container so the
-    # browser naturally keeps the newest line in view.
-    st.markdown(
-        f"""<div id="quilgo-log-box" style="
-                height:420px; overflow-y:auto; padding:10px;
-                background:#0e1117; color:#e6edf3;
-                border:1px solid #30363d; border-radius:6px;
-                font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-                font-size:12px; white-space:pre-wrap; word-break:break-word;">
-{_html_escape(log_text)}
-            </div>
-            <script>
-                const el = window.parent.document.getElementById('quilgo-log-box')
-                          || document.getElementById('quilgo-log-box');
-                if (el) {{ el.scrollTop = el.scrollHeight; }}
-            </script>""",
-        unsafe_allow_html=True,
-    )
-    if len(log_lines) > TAIL:
-        st.caption(f"Showing last {TAIL} of {len(log_lines)} lines · full log in the download below")
+    _live_log(snap["run_id"], running)
 
-    # Offer a download of the current run's full on-disk log (streamed from start).
-    # Cache the bytes in session_state so the media ID stays stable across the
-    # sub-second polling reruns, avoiding MediaFileStorageError noise in the logs.
-    lf = st.session_state.get("current_log_file")
-    if lf and Path(lf).exists():
+    # Download of the finished run's full log (outside the fragment so the
+    # file isn't re-registered every second).
+    lf = snap["log_file"]
+    if lf and not running and Path(lf).exists():
         try:
-            cache_key = f"_log_bytes_{lf}"
-            if not running:
-                # Task finished — read once and cache so the final log is stable.
-                if cache_key not in st.session_state:
-                    with open(lf, "rb") as _fh:
-                        st.session_state[cache_key] = _fh.read()
-                log_bytes = st.session_state[cache_key]
-            else:
-                # Task still running — read fresh each time but don't cache yet.
-                with open(lf, "rb") as _fh:
-                    log_bytes = _fh.read()
             st.download_button(
-                "⬇ Download full run log",
-                data=log_bytes,
-                file_name=Path(lf).name,
-                mime="text/plain",
-                key="btn_dl_log",
+                "⬇ Download full run log", data=Path(lf).read_bytes(),
+                file_name=Path(lf).name, mime="text/plain", key="btn_dl_log",
                 help=f"Full log file for this run (auto-deleted after {LOG_RETENTION_DAYS} days)",
             )
-            st.caption(f"📄 Log file: `{Path(lf).name}` · kept for {LOG_RETENTION_DAYS} days")
         except Exception:
             pass
+    if lf:
+        st.caption(f"📄 Log file: `{Path(lf).name}` · kept for {LOG_RETENTION_DAYS} days")
 
     # ── Folder info ───────────────────────────────────────────────────────────
-    fc1, fc2, _ = st.columns([1,1,4])
+    fc1, fc2, _ = st.columns([1, 1, 4])
     with fc1:
         if quilgo_ready and st.button("📂 Quilgo folder", key="btn_f1"):
-            try:
-                from core.processing.file_helpers import find_latest_run_folder
-                f = find_latest_run_folder(config.PROJECT_ROOT)
-                st.info(str(f))
-            except Exception as e: st.error(str(e))
+            st.info(str(config.QUILGO_MASTER_DIR))
     with fc2:
         if cache_ready and st.button("📂 Backups folder", key="btn_f2"):
             st.info(str(config.DOWNLOADS_DIR))
-
-    # ── Auto-refresh while running ────────────────────────────────────────────
-    if st.session_state.task_running:
-        time.sleep(0.4)   # tighter cadence → log feels like a live terminal
-        st.rerun()
-    elif not st.session_state.task_running and st.session_state.log_queue.qsize() > 0:
-        # Task just finished but queue has remaining lines — drain once more
-        st.rerun()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Manual review overlay
-# ══════════════════════════════════════════════════════════════════════════════
-def _render_review():
-    pr = st.session_state.review_pending
-    c  = pr["candidate_data"]
-
-    st.warning(f"⚠️ Manual Review {pr['review_num']} of {pr['total_reviews']}")
-    st.subheader(f"👤 {c.get('full_name','N/A')}")
-    st.markdown(f"📧 {_copyable_email_html(c.get('email','N/A'))}", unsafe_allow_html=True)
-
-    role_data = c.get("roles",{}).get(pr["role_name"],{})
-    reasons   = role_data.get("manual_review_reasons", [])
-    st.markdown(f"**Role:** `{_rl(pr['role_name'])}`")
-    if reasons:
-        st.error("Integrity flags:\n" + "\n".join(f"- {r}" for r in reasons))
-
-    with st.expander("Full breakdown", expanded=True):
-        for rname, rdata in c.get("roles",{}).items():
-            if not rdata.get("tests"): continue
-            st.markdown(f"**{'🟡' if 'MANUAL' in rdata.get('status','') else ('🟢' if 'QUALIFIED' in rdata.get('status','') else '🔴')} {_rl(rname)}** — {rdata.get('status','')}")
-            _reasons = rdata.get("manual_review_reasons", [])
-            for t in rdata.get("tests", []):
-                tname = t.get("name", "?")
-                detail = next((r[len(tname) + 2:] for r in _reasons if r.startswith(tname + ": ")), "")
-                detail_str = f" | ⚠ {detail}" if detail else ""
-                st.markdown(f"&nbsp;&nbsp;• {tname}: **{t.get('score','N/A')}** | {t.get('status','')}{detail_str}", unsafe_allow_html=True)
-
-    just = st.text_area("Justification (required for Approve/Reject)", key="rv_just", height=80)
-
-    r1,r2,r3,r4 = st.columns(4)
-    with r1:
-        if st.button("✅ Approve", type="primary", key="rv_approve"):
-            if not just.strip(): st.error("Enter a justification.")
-            else:
-                st.session_state.review_answer_box["answer"] = ("approve", just.strip())
-                st.session_state.review_event.set()
-                st.session_state.review_pending = None; st.rerun()
-    with r2:
-        if st.button("❌ Reject", key="rv_reject"):
-            if not just.strip(): st.error("Enter a justification.")
-            else:
-                st.session_state.review_answer_box["answer"] = ("reject", just.strip())
-                st.session_state.review_event.set()
-                st.session_state.review_pending = None; st.rerun()
-    with r3:
-        if st.button("⏭ Skip candidate", key="rv_skip"):
-            st.session_state.review_answer_box["answer"] = ("skip", "")
-            st.session_state.review_event.set()
-            st.session_state.review_pending = None; st.rerun()
-    with r4:
-        if st.button("⏩ Skip ALL reviews", key="rv_skip_all"):
-            st.session_state.review_answer_box["answer"] = ("skip_all", "")
-            st.session_state.review_event.set()
-            st.session_state.review_pending = None; st.rerun()
-
-    time.sleep(0.5); st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE: Final Review
@@ -1330,13 +1093,32 @@ def _candidate_matches_filters(cand, status, qroles, f):
 
     return True
 
+def _store_draft(run_id, key):
+    """on_change: keep typed-but-unsaved dashboard input on disk."""
+    store.set_draft(run_id, key, st.session_state[key])
+
+
+def _commit_candidate(i, cand, ck, run_id):
+    """Save a decided/edited candidate and drop its drafts and widget state."""
+    _save_candidate(i, cand)
+    marker = f"_{ck}_"
+    stale = [k for k in list(st.session_state.keys()) if marker in str(k)]
+    store.clear_drafts(run_id, stale + [k for k in store.load_drafts(run_id) if marker in k])
+    for k in stale:
+        st.session_state.pop(k, None)
+
+
 def page_final_review():
+    err = st.session_state.pop("_start_error", None)
+    if err:
+        st.error(err)
     results = st.session_state.final_results or []
     # Forward-compat: normalise any MANUAL REVIEW roles without a matching
     # Pending entry (see _normalise_pending for the full rationale). Safe
     # no-op on already-normalised candidates.
     for _c in results:
-        _normalise_pending(_c)
+        if _normalise_pending(_c):
+            store.update_candidate(_c)
     # Pre-compute status for every candidate — drives summary strip, filters,
     # AND the push guard, so this has to happen before the action bar.
     status_cache = [_final_status(c) for c in results] if results else []
@@ -1346,11 +1128,15 @@ def page_final_review():
     cb, cp = st.columns([2, 1])
     with cb:
         if st.button("← Back to Control Panel", key="fr_back"):
-            st.session_state.page = "control"; st.rerun()
+            _go("control")
     with cp:
+        task = runner.snapshot()
         # Block push while ANY candidate has a Pending manual decision —
         # otherwise un-reviewed cases would silently ship to Manatal.
-        if pending_count > 0:
+        if task["running"]:
+            st.button(f"🚀 Push unavailable — {task['name']} is running",
+                      key="fr_push_busy", disabled=True)
+        elif pending_count > 0:
             st.button(
                 f"🚀 Push blocked — {pending_count} pending",
                 key="fr_push_blocked", disabled=True,
@@ -1361,17 +1147,13 @@ def page_final_review():
             if st.button(lbl, type="primary", key="fr_push"):
                 if st.session_state.confirm_push:
                     _, _, ak = _load_creds()
-                    if "review_answer_box" not in st.session_state:
-                        st.session_state.review_answer_box = {}
-                    # Snapshot the current edited results as a plain list so
-                    # the background thread sees dashboard edits, not stale
-                    # Part 2 output. `copy.deepcopy` prevents the thread from
-                    # mutating session state while the UI is still rendering.
-                    snapshot = copy.deepcopy(st.session_state.final_results or [])
-                    _launch(_task_api_push,
-                            args=(st.session_state.log_queue, ak, snapshot))
+                    # Push exactly what is saved on disk (every dashboard edit
+                    # is saved there the moment it's made).
+                    snapshot = store.load().get("candidates", [])
                     st.session_state.confirm_push = False
-                    st.session_state.page = "control"; st.rerun()
+                    if _start_task("API Push", _task_api_push, ak, snapshot):
+                        _go("control")
+                    st.rerun()
                 else:
                     st.session_state.confirm_push = True; st.rerun()
 
@@ -1380,6 +1162,19 @@ def page_final_review():
 
     if not results:
         st.info("No results yet. Run Part 2 first."); return
+
+    run_meta = store.load()
+    def _when(ts):
+        try:
+            return datetime.datetime.fromisoformat(ts).astimezone().strftime("%d %b %H:%M")
+        except Exception:
+            return "—"
+    st.caption(
+        f"💾 Results from the {run_meta.get('task', 'Part 2')} run of "
+        f"**{_when(run_meta.get('created_at'))}** · last edit {_when(run_meta.get('edited_at'))} "
+        f"· last push {_when(run_meta.get('pushed_at'))} · "
+        "every decision is saved as soon as you make it."
+    )
 
     if pending_count > 0:
         st.error(
@@ -1444,7 +1239,7 @@ def page_final_review():
             )
         with gc3:
             f_collapse_happy = st.checkbox(
-                "Collapse approved", value=True, key="fr_f_collapse_happy",
+                "Collapse approved", key="fr_f_collapse_happy",
                 help="Render approved + no-manual-decision candidates as a one-line row.",
             )
 
@@ -1492,7 +1287,17 @@ def page_final_review():
         return
 
     # ── Render ────────────────────────────────────────────────────────────────
+    run_id = st.session_state.results_run_id
+    drafts = store.load_drafts(run_id)
+
+    def _dkw(key, saved):
+        """Widget kwargs: start from the draft if there is one, save edits as drafts."""
+        return dict(value=drafts.get(key, saved), key=key,
+                    on_change=_store_draft, args=(run_id, key))
+
     for (i, cand) in filtered:
+        ck = store.candidate_key(cand)
+        has_draft = any(f"_{ck}_" in k for k in drafts)
         status, qroles = status_cache[i]
         if status == "APPROVED":  icon = "🟢"
         elif status == "PENDING": icon = "⏳"
@@ -1505,7 +1310,8 @@ def page_final_review():
         # pending reviews → render as a compact one-line row. Pending ALWAYS
         # gets a full expander so the reviewer can act on it.
         compact = (f_collapse_happy and status == "APPROVED"
-                   and not has_manual and not has_empty and not has_pending)
+                   and not has_manual and not has_empty and not has_pending
+                   and not has_draft)
 
         if compact:
             roles_line = ", ".join(_rl(r) for r in qroles) if qroles else "—"
@@ -1525,11 +1331,12 @@ def page_final_review():
         if has_pending: flags.append("⏳ pending review")
         if has_manual and not has_pending: flags.append("⚖ manual")
         if has_empty:  flags.append("⬚ missing scores")
-        flag_suffix = f"  ·  {' · '.join(flags)}" if flags else ""
 
         # Auto-expand the ones that need your eyes — Pending always expands
         expand_default = (status in ("REJECTED", "PENDING")
-                          or has_manual or has_empty)
+                          or has_manual or has_empty or has_draft)
+        if has_draft: flags.append("📝 unsaved draft")
+        flag_suffix = f"  ·  {' · '.join(flags)}" if flags else ""
 
         # Rejected candidates get a more specific label so "did not attempt"
         # and "failed" aren't lumped together under one generic REJECTED.
@@ -1541,18 +1348,11 @@ def page_final_review():
                   f"{cand.get('email','N/A')}")
 
         with st.expander(header + flag_suffix, expanded=expand_default):
-            # The goal of this block is to mirror the information shown by the
-            # Part 2 manual-review overlay (`_render_review`) one-to-one, so
-            # reviewers see the SAME context here that they would have seen had
-            # they gone through the overlay during the run.
-            #
-            # Overlay content (in order):
-            #   1. Qualified-for / Did-not-meet summary
-            #   2. "Integrity flags:" red box — filtered to reasons containing
-            #      the word "integrity"
+            # Content (in order):
+            #   1. Outcome summary (qualified / pending / did not attempt / failed)
+            #   2. "Integrity flags:" red box — every integrity reason per role
             #   3. "Full breakdown" expander (open by default) — per-role
             #      status icon + status, then per-test `name: score | status`
-            # Nothing else.
 
             st.markdown(f"📧 {_copyable_email_html(cand.get('email','N/A'))}", unsafe_allow_html=True)
 
@@ -1575,15 +1375,14 @@ def page_final_review():
                 if rej_reasons:
                     st.caption(" · ".join(f"{_rl(rn)}: {why}" for rn, why in rej_reasons))
 
-            # (2) Integrity flags — same filter the overlay uses:
-            #     only reasons whose text contains "integrity".
+            # (2) Integrity flags
             integrity_reasons = []
             for rname, rdata in cand.get("roles", {}).items():
                 for reason in rdata.get("manual_review_reasons", []):
                     integrity_reasons.append((rname, reason))
             if integrity_reasons:
                 # st.error can't render a role→reason list cleanly, so we
-                # hand-roll a red box that matches the overlay's styling.
+                # hand-roll a red box.
                 items = "".join(
                     f"<li><b>{_html_escape(_rl(rn))}</b> — {_html_escape(r)}</li>"
                     for rn, r in integrity_reasons
@@ -1598,7 +1397,7 @@ def page_final_review():
                     unsafe_allow_html=True,
                 )
 
-            # (3) Full breakdown — exactly the overlay's layout:
+            # (3) Full breakdown:
             #     🟡/🟢/🔴 role — status
             #       • test_name: score | test_status
             role_items = [(rn, rd) for rn, rd in cand.get("roles", {}).items()
@@ -1663,7 +1462,7 @@ def page_final_review():
                         )
                         v = "N/A"  # preserved as-is by Save (skipped below)
                     else:
-                        v = st.text_input(label, value=str(raw), key=f"sc_{i}_{uk}")
+                        v = st.text_input(label, **_dkw(f"sc_{ck}_{uk}", str(raw)))
                         try:
                             nf = float(v)
                             if nf >= PASS_THRESHOLD:
@@ -1682,9 +1481,9 @@ def page_final_review():
                 ci += 1
 
             # Manual decisions split into two groups:
-            #   • Pending — shown overlay-style with Approve / Reject buttons
+            #   • Pending — shown with Approve / Reject buttons
             #     and a required justification. Clicking a button saves
-            #     immediately (just like the Part 2 overlay did).
+            #     immediately.
             #   • Already resolved (Approved / Rejected) — shown with a
             #     selectbox so the reviewer can change their mind; these are
             #     persisted by the "💾 Save & Re-evaluate" button at the
@@ -1706,19 +1505,17 @@ def page_final_review():
                     # decision block applies to.
                     st.markdown(f"**Role:** `{_html_escape(_rl(rn))}`")
 
-                    just_key = f"pj_{i}_{j}"
                     nj = st.text_area(
                         "Justification (required for Approve/Reject)",
-                        value=dec.get("justification", ""),
-                        height=80, key=just_key,
+                        height=80, **_dkw(f"pj_{ck}_{j}", dec.get("justification", "")),
                     )
 
-                    err_key = f"pe_{i}_{j}"
+                    err_key = f"pe_{ck}_{j}"
 
                     b1, b2, _sp = st.columns([1, 1, 3])
                     with b1:
                         if st.button("✅ Approve", type="primary",
-                                     key=f"pa_{i}_{j}"):
+                                     key=f"pa_{ck}_{j}"):
                             if not (nj or "").strip():
                                 st.session_state[err_key] = "Enter a justification."
                                 st.rerun()
@@ -1739,11 +1536,11 @@ def page_final_review():
                                     edited["roles"][rn]["status"] = (
                                         "QUALIFIED (Manually Approved)")
                                 refreshed = _reevaluate(edited)
-                                st.session_state.final_results[i] = refreshed
                                 st.session_state.pop(err_key, None)
+                                _commit_candidate(i, refreshed, ck, run_id)
                                 st.rerun()
                     with b2:
-                        if st.button("❌ Reject", key=f"pr_{i}_{j}"):
+                        if st.button("❌ Reject", key=f"pr_{ck}_{j}"):
                             if not (nj or "").strip():
                                 st.session_state[err_key] = "Enter a justification."
                                 st.rerun()
@@ -1759,8 +1556,8 @@ def page_final_review():
                                     edited["roles"][rn]["status"] = (
                                         "FAIL (Manually Rejected)")
                                 refreshed = _reevaluate(edited)
-                                st.session_state.final_results[i] = refreshed
                                 st.session_state.pop(err_key, None)
+                                _commit_candidate(i, refreshed, ck, run_id)
                                 st.rerun()
 
                     err = st.session_state.get(err_key)
@@ -1783,10 +1580,11 @@ def page_final_review():
                     auto = dec.get("automatic_outcome")
                     d1, d2 = st.columns([1, 2])
                     with d1:
+                        dkey = f"dec_{ck}_{j}"
                         nd = st.selectbox(
                             f"Decision '{_rl(rn)}'", ["Approved", "Rejected"],
-                            index=0 if dec.get("decision") == "Approved" else 1,
-                            key=f"dec_{i}_{j}",
+                            index=0 if drafts.get(dkey, dec.get("decision")) == "Approved" else 1,
+                            key=dkey, on_change=_store_draft, args=(run_id, dkey),
                         )
                         if auto is not None:
                             st.caption(f"Automatic result: {auto}")
@@ -1799,16 +1597,18 @@ def page_final_review():
                         if auto is None or overriding:
                             just_label += "  (required)"
                         nj2 = st.text_area(
-                            just_label,
-                            value=dec.get("justification", ""),
-                            height=80, key=f"just_{i}_{j}",
+                            just_label, height=80,
+                            **_dkw(f"just_{ck}_{j}", dec.get("justification", "")),
                         )
                         if overriding:
                             st.caption("⚠ Overrides the automatic result.")
                     edited["manual_decisions"][j]["decision"]      = nd
                     edited["manual_decisions"][j]["justification"] = nj2
 
-            if st.button("💾 Save & Re-evaluate", key=f"save_{i}"):
+            if has_draft:
+                st.caption("📝 You have unsaved changes for this candidate (kept as a draft "
+                           "— they'll still be here if you leave the page). Click Save to apply them.")
+            if st.button("💾 Save & Re-evaluate", key=f"save_{ck}"):
                 # Justification is required whenever a decision disagrees with the
                 # automatic result, and always for a genuine manual-review role
                 # (automatic_outcome is None) — same rule as the Pending flow above.
@@ -1836,8 +1636,8 @@ def page_final_review():
                     try:
                         _apply_score_edits(edited, score_inp)
                         edited = _reevaluate(edited)
-                        st.session_state.final_results[i] = edited
-                        st.success("✅ Saved."); st.rerun()
+                        _commit_candidate(i, edited, ck, run_id)
+                        st.rerun()
                     except ValueError:
                         st.error("Scores must be numbers.")
                     except Exception as e:
@@ -1846,24 +1646,71 @@ def page_final_review():
 # ══════════════════════════════════════════════════════════════════════════════
 # Router
 # ══════════════════════════════════════════════════════════════════════════════
+@st.fragment(run_every=2.0)
+def _sidebar_status():
+    """Task status on every page, refreshed on its own without redrawing the page."""
+    snap = runner.snapshot()
+    if snap["running"]:
+        st.info(f"⏳ **{snap['name']}** running · "
+                f"{_fmt_elapsed(time.time() - snap['started_at'])}")
+    elif snap["run_id"]:
+        if snap["succeeded"]:
+            st.success(f"✅ {snap['name']} finished")
+        else:
+            st.error(f"❌ {snap['name']} failed")
+    if (st.session_state.page == "final_review"
+            and store.version() != st.session_state.results_version):
+        st.warning("New results were saved since this page loaded.")
+        if st.button("↻ Load latest results", key="sb_reload", use_container_width=True):
+            st.rerun(scope="app")
+
+
 def main():
+    # First visit with no saved credentials → start on Settings.
+    if not st.session_state.get("_landed"):
+        st.session_state._landed = True
+        if "page" not in st.query_params and not _load_creds()[2]:
+            st.session_state.page = "settings"
+
+    _sync_results()
+
+    # Follow a Part 2 this tab started through to the Final Review once it's done.
+    snap = runner.snapshot()
+    aw = st.session_state.awaiting_run_id
+    if aw and not snap["running"] and snap["run_id"] == aw:
+        st.session_state.awaiting_run_id = None
+        if snap["succeeded"] and st.session_state.page == "control" and st.session_state.final_results:
+            _go("final_review")
+
     with st.sidebar:
         if (config.ASSETS_DIR / "logo.png").exists():
             st.image(str(config.ASSETS_DIR / "logo.png"), width=120)
         st.title("Navigation")
         if st.button("⚙️ Settings",      use_container_width=True, key="nav_settings"):
-            st.session_state.page = "settings"; st.rerun()
+            _go("settings")
         if st.button("🎯 Control Panel", use_container_width=True, key="nav_control"):
-            st.session_state.page = "control";  st.rerun()
+            _go("control")
         if st.session_state.final_results:
             if st.button("📊 Final Review", use_container_width=True, key="nav_final"):
-                st.session_state.page = "final_review"; st.rerun()
+                _go("final_review")
+
+        _sidebar_status()
+
+        # Test Mode + Stage Freeze badges — visible on every page.
+        _tm, _te, _freeze = _load_push_settings()
+        if _tm:
+            st.warning(f"🛡️ **Test Mode ON** — only {len(_te)} whitelisted email(s) will be pushed.")
+        else:
+            st.success("🚀 **Test Mode OFF** — all candidates will be pushed.")
+        if _freeze:
+            st.warning("⏸ **Stage Freeze ON** — fellows will NOT be moved between stages.")
+        st.divider()
 
     p = st.session_state.page
     if p == "settings":       page_settings()
     elif p == "control":      page_control()
     elif p == "final_review": page_final_review()
-    else: st.session_state.page = "settings"; st.rerun()
+    else: _go("control")
 
 if __name__ == "__main__":
     main()

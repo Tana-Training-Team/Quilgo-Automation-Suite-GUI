@@ -169,6 +169,15 @@ def trigger_api_push(api_key, final_results=None):
         all_candidates_df = _cached_data_for_api_push.get('all_candidates_df')
         all_profiles_raw = _cached_data_for_api_push.get('all_profiles_raw')
 
+        # After a server/container restart the in-memory copy is gone, but Part 2
+        # saved the same Manatal profiles to disk. Results are reloaded from disk
+        # by the dashboard, so the push can still go ahead.
+        if all_profiles_raw is None and config.MANATAL_CACHE_FILE.exists():
+            with open(config.MANATAL_CACHE_FILE, 'r') as f:
+                all_profiles_raw = json.load(f)
+            _cached_data_for_api_push['all_profiles_raw'] = all_profiles_raw
+            print(f"✔ Loaded {len(all_profiles_raw)} Manatal profiles from {config.MANATAL_CACHE_FILE.name}.")
+
         if all_candidates_df is None or all_profiles_raw is None:
             print("❌ ERROR: No processed candidate data found in cache. Please run the processor first.")
             return False
