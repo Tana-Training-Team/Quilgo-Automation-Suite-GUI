@@ -1290,13 +1290,23 @@ def page_final_review():
     run_id = st.session_state.results_run_id
     drafts = store.load_drafts(run_id)
 
+    # Results were replaced by a new run since this tab last drew them.
+    seen = st.session_state.get("_rendered_run_id")
+    if seen and seen != run_id:
+        st.warning("🔄 **A new run replaced the results you were looking at.** "
+                   "Anything you clicked on the old results was not applied — "
+                   "please review the current list below.")
+    st.session_state._rendered_run_id = run_id
+
     def _dkw(key, saved):
         """Widget kwargs: start from the draft if there is one, save edits as drafts."""
         return dict(value=drafts.get(key, saved), key=key,
                     on_change=_store_draft, args=(run_id, key))
 
     for (i, cand) in filtered:
-        ck = store.candidate_key(cand)
+        # The run id is part of every widget key, so a click made on a page
+        # still showing an older run can't land on the new run's candidate.
+        ck = f"{run_id}_{store.candidate_key(cand)}"
         has_draft = any(f"_{ck}_" in k for k in drafts)
         status, qroles = status_cache[i]
         if status == "APPROVED":  icon = "🟢"

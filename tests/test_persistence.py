@@ -124,6 +124,19 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(cand["roles"]["Data Analyst"]["status"], "MANUAL REVIEW (Pending)")
         self.assertIn("Low trust score", cand["original_row"]["summary_note_md"])
 
+    def test_click_on_old_results_is_not_applied_to_a_new_run(self):
+        at = _session("final_review")                  # reviewer has run 1 open
+        self._pending_expander_text(at)[0].input("approve on run 1 data")
+        results, integ = _evaluate()
+        store.save_new_run(results, integ, "Part 2")    # a new run finishes meanwhile
+        next(b for b in at.button if b.key and b.key.startswith("pa_")).click().run()
+        self.assertFalse(at.exception)
+
+        cand = next(c for c in store.load()["candidates"] if c["email"] == "pending@x")
+        dec = next(d for d in cand["manual_decisions"] if d["role"] == "Data Analyst")
+        self.assertEqual(dec["decision"], "Pending", "the stale click must not approve new data")
+        self.assertTrue(any("A new run replaced the results" in w.value for w in at.warning))
+
     def test_page_survives_a_refresh(self):
         at = _session("final_review")
         self.assertEqual(at.session_state["page"], "final_review")
