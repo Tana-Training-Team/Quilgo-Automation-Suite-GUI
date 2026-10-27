@@ -91,8 +91,7 @@ def _init():
     st.session_state.final_results  = []
     st.session_state.results_run_id = None
     st.session_state.results_version = None
-    st.session_state.confirm_push   = False
-    st.session_state.confirm_replace = None   # task name awaiting "replace results?" confirm
+    st.session_state.stale_notice    = False  # "a new run replaced your results" until "Got it"
     st.session_state.awaiting_run_id = None   # run this tab started and will follow to Final Review
 
 _init()
@@ -103,6 +102,23 @@ def _go(page):
     st.session_state.page = page
     st.query_params["page"] = page
     st.rerun()
+
+
+def _toast(msg, icon=None):
+    """
+    Small corner notice that fades on its own — for quick confirmations.
+    Queued and shown on the next redraw, because most actions end with
+    st.rerun(), which would otherwise wipe a toast before anyone sees it.
+    """
+    st.session_state.setdefault("_toasts", []).append((msg, icon))
+
+
+def _show_toasts():
+    # Short duration on purpose: Streamlit doesn't show a new toast while an
+    # older one is still on screen, so a long-lived toast would swallow the
+    # next action's confirmation. The page itself always shows the real state.
+    for msg, icon in st.session_state.pop("_toasts", []):
+        st.toast(msg, icon=icon, duration=2)
 
 
 def _sync_results():
@@ -411,10 +427,10 @@ def _start_task(name, target, *args, follow_to_final=False):
     """Start a task on the shared runner; tell the user if one is already running."""
     run_id = runner.start(name, target, *args)
     if run_id is None:
-        st.session_state["_start_error"] = (
-            f"⚠ {runner.snapshot()['name']} is already running — wait for it to finish.")
+        _toast(f"{runner.snapshot()['name']} is already running — wait for it to finish.", "⚠️")
     else:
         st.session_state.awaiting_run_id = run_id if follow_to_final else None
+        _toast(f"{name} started — you can leave this page, it keeps running.", "▶️")
     return run_id
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -584,7 +600,7 @@ def page_settings():
 
     if save:
         _save_creds(ne, np_, nk)
-        st.success("✅ Credentials saved!")
+        _toast("Credentials saved", "✅"); st.rerun()
     if go:
         _save_creds(ne, np_, nk)
         _go("control")
@@ -645,11 +661,11 @@ def page_settings():
         if save_push:
             parsed = [e.strip().lower() for e in email_text.splitlines() if e.strip()]
             _save_push_settings(True, parsed)
-            st.success(f"✅ Saved — {len(parsed)} email(s) whitelisted.")
+            _toast(f"Saved — {len(parsed)} email(s) whitelisted", "✅"); st.rerun()
 
         if reset_push:
             _save_push_settings(True, sorted(DEFAULT_TEST_EMAILS))
-            st.success("↺ Reset to defaults.")
+            _toast("Test emails reset to defaults", "↺")
             st.rerun()
 
     st.divider()
@@ -738,10 +754,28 @@ def _request_task(name, all_quizzes):
     """
     replaces_results = name != "Part 1" or st.session_state.w_auto
     if replaces_results and store.has_unpushed_edits():
-        st.session_state.confirm_replace = name
+        _confirm_replace_dialog(name, all_quizzes)
     else:
         _launch_requested(name, all_quizzes)
-    st.rerun()
+        st.rerun()
+
+
+@st.dialog("Replace unpushed review work?")
+def _confirm_replace_dialog(name, all_quizzes):
+    run = store.load()
+    st.warning(
+        f"**{name} will replace the current Final Review results** "
+        f"({len(run.get('candidates', []))} candidates). They have review edits "
+        "that have **not been pushed to Manatal** yet."
+    )
+    st.caption("The current results are kept as a backup in "
+               "downloads/state/results_prev.json, but they won't be shown on the dashboard.")
+    k1, k2 = st.columns(2)
+    if k1.button("Yes, replace them", type="primary", key="cr_yes", use_container_width=True):
+        _launch_requested(name, all_quizzes)
+        st.rerun()
+    if k2.button("Cancel", key="cr_no", use_container_width=True):
+        st.rerun()
 
 
 @st.fragment(run_every=1.0)
@@ -838,31 +872,6 @@ def page_control():
     snap = runner.snapshot()
     running = snap["running"]
     st.title("🎯 Control Panel")
-
-    err = st.session_state.pop("_start_error", None)
-    if err:
-        st.error(err)
-
-    # ── "Replace unpushed review work?" confirmation ─────────────────────────
-    pending_task = st.session_state.confirm_replace
-    if pending_task and not running:
-        run = store.load()
-        with st.container(border=True):
-            st.warning(
-                f"⚠ **{pending_task} will replace the current Final Review results** "
-                f"({len(run.get('candidates', []))} candidates), which have review edits "
-                "that have **not been pushed to Manatal** yet. "
-                "The current results are kept as a backup (downloads/state/results_prev.json), "
-                "but they will no longer be shown on the dashboard."
-            )
-            k1, k2, _ = st.columns([1, 1, 3])
-            if k1.button("Yes, replace them", type="primary", key="cr_yes"):
-                st.session_state.confirm_replace = None
-                _launch_requested(pending_task, all_quizzes)
-                st.rerun()
-            if k2.button("Cancel", key="cr_no"):
-                st.session_state.confirm_replace = None
-                st.rerun()
 
     st.checkbox("Run Part 2 automatically after successful Part 1", key="w_auto")
 
@@ -1093,9 +1102,28 @@ def _candidate_matches_filters(cand, status, qroles, f):
 
     return True
 
-def _store_draft(run_id, key):
-    """on_change: keep typed-but-unsaved dashboard input on disk."""
-    store.set_draft(run_id, key, st.session_state[key])
+def _same_value(a, b):
+    """Equal as entered — "9" and "9.0" are the same score."""
+    if a == b:
+        return True
+    try:
+        return float(a) == float(b)
+    except (TypeError, ValueError):
+        return False
+
+
+def _store_draft(run_id, key, saved):
+    """
+    on_change: keep typed-but-unsaved dashboard input on disk. Only real
+    differences from the saved value count — Streamlit also fires on_change
+    when a widget is redrawn after a save, and putting a value back the way
+    it was should clear the "unsaved draft" marker.
+    """
+    value = st.session_state[key]
+    if _same_value(value, saved):
+        store.clear_drafts(run_id, [key])
+    else:
+        store.set_draft(run_id, key, value)
 
 
 def _commit_candidate(i, cand, ck, run_id):
@@ -1108,10 +1136,47 @@ def _commit_candidate(i, cand, ck, run_id):
         st.session_state.pop(k, None)
 
 
+@st.dialog("Push to Manatal?")
+def _confirm_push_dialog():
+    """Show exactly what the push will do before anything is sent."""
+    cands = store.load().get("candidates", [])
+    test_mode, test_emails, freeze = _load_push_settings()
+    allowed = {e.strip().lower() for e in test_emails}
+    if test_mode:
+        n_push = sum(1 for c in cands if str(c.get("email", "")).strip().lower() in allowed)
+    else:
+        n_push = len(cands)
+    approved = sum(1 for c in cands if _final_status(c)[0] == "APPROVED")
+
+    st.markdown(f"**{n_push} of {len(cands)} fellow(s) will be updated in Manatal** "
+                f"({approved} approved, {len(cands) - approved} not).")
+    if test_mode:
+        st.warning(f"🛡️ **Test Mode ON** — only the {len(allowed)} whitelisted email(s) "
+                   "are pushed; everyone else is skipped.")
+    else:
+        st.error("🚀 **Test Mode OFF** — this is a live push to every fellow listed.")
+    if freeze:
+        st.info("⏸ **Stage Freeze ON** — notes and scores are sent, but nobody is moved "
+                "between stages.")
+    else:
+        st.info("▶ Fellows will be moved to their next stage.")
+    st.caption("Each fellow gets a new note on their Manatal match. This can't be undone "
+               "from here.")
+
+    k1, k2 = st.columns(2)
+    if k1.button("Push now", type="primary", key="pd_yes", use_container_width=True,
+                 disabled=n_push == 0):
+        _, _, ak = _load_creds()
+        # Push exactly what is saved on disk (every dashboard edit is saved
+        # there the moment it's made).
+        if _start_task("API Push", _task_api_push, ak, cands):
+            _go("control")
+        st.rerun()
+    if k2.button("Cancel", key="pd_no", use_container_width=True):
+        st.rerun()
+
+
 def page_final_review():
-    err = st.session_state.pop("_start_error", None)
-    if err:
-        st.error(err)
     results = st.session_state.final_results or []
     # Forward-compat: normalise any MANUAL REVIEW roles without a matching
     # Pending entry (see _normalise_pending for the full rationale). Safe
@@ -1143,25 +1208,27 @@ def page_final_review():
                 help="Resolve all Pending manual decisions before pushing.",
             )
         else:
-            lbl = "⚠️ Confirm — click again!" if st.session_state.confirm_push else "🚀 Push All to Manatal"
-            if st.button(lbl, type="primary", key="fr_push"):
-                if st.session_state.confirm_push:
-                    _, _, ak = _load_creds()
-                    # Push exactly what is saved on disk (every dashboard edit
-                    # is saved there the moment it's made).
-                    snapshot = store.load().get("candidates", [])
-                    st.session_state.confirm_push = False
-                    if _start_task("API Push", _task_api_push, ak, snapshot):
-                        _go("control")
-                    st.rerun()
-                else:
-                    st.session_state.confirm_push = True; st.rerun()
-
-    if st.session_state.confirm_push and pending_count == 0:
-        st.warning("About to push to Manatal — click again to confirm.")
+            if st.button("🚀 Push All to Manatal", type="primary", key="fr_push"):
+                _confirm_push_dialog()
 
     if not results:
         st.info("No results yet. Run Part 2 first."); return
+
+    # "A new run replaced your results" — at the top of the page, and it stays
+    # until the reviewer dismisses it, so it can't vanish on the next click.
+    run_id = st.session_state.results_run_id
+    seen = st.session_state.get("_rendered_run_id")
+    if seen and seen != run_id:
+        st.session_state.stale_notice = True
+    st.session_state._rendered_run_id = run_id
+    if st.session_state.stale_notice:
+        n1, n2 = st.columns([6, 1])
+        n1.warning("🔄 **A new run replaced the results you were looking at.** "
+                   "Anything you clicked on the old results was not applied — "
+                   "please review the current list below.")
+        if n2.button("Got it", key="stale_ok", use_container_width=True):
+            st.session_state.stale_notice = False
+            st.rerun()
 
     run_meta = store.load()
     def _when(ts):
@@ -1291,17 +1358,11 @@ def page_final_review():
     drafts = store.load_drafts(run_id)
 
     # Results were replaced by a new run since this tab last drew them.
-    seen = st.session_state.get("_rendered_run_id")
-    if seen and seen != run_id:
-        st.warning("🔄 **A new run replaced the results you were looking at.** "
-                   "Anything you clicked on the old results was not applied — "
-                   "please review the current list below.")
-    st.session_state._rendered_run_id = run_id
 
     def _dkw(key, saved):
         """Widget kwargs: start from the draft if there is one, save edits as drafts."""
         return dict(value=drafts.get(key, saved), key=key,
-                    on_change=_store_draft, args=(run_id, key))
+                    on_change=_store_draft, args=(run_id, key, saved))
 
     for (i, cand) in filtered:
         # The run id is part of every widget key, so a click made on a page
@@ -1540,6 +1601,7 @@ def page_final_review():
                                 except ValueError:
                                     st.session_state[err_key] = "Scores must be numbers."
                                     st.rerun()
+                                _toast(f"Approved — {cand.get('full_name','')} · {_rl(rn)}", "✅")
                                 edited["manual_decisions"][j]["decision"] = "Approved"
                                 edited["manual_decisions"][j]["justification"] = nj.strip()
                                 if rn in edited.get("roles", {}):
@@ -1560,6 +1622,7 @@ def page_final_review():
                                 except ValueError:
                                     st.session_state[err_key] = "Scores must be numbers."
                                     st.rerun()
+                                _toast(f"Rejected — {cand.get('full_name','')} · {_rl(rn)}", "❌")
                                 edited["manual_decisions"][j]["decision"] = "Rejected"
                                 edited["manual_decisions"][j]["justification"] = nj.strip()
                                 if rn in edited.get("roles", {}):
@@ -1594,7 +1657,8 @@ def page_final_review():
                         nd = st.selectbox(
                             f"Decision '{_rl(rn)}'", ["Approved", "Rejected"],
                             index=0 if drafts.get(dkey, dec.get("decision")) == "Approved" else 1,
-                            key=dkey, on_change=_store_draft, args=(run_id, dkey),
+                            key=dkey, on_change=_store_draft,
+                            args=(run_id, dkey, dec.get("decision")),
                         )
                         if auto is not None:
                             st.caption(f"Automatic result: {auto}")
@@ -1647,6 +1711,7 @@ def page_final_review():
                         _apply_score_edits(edited, score_inp)
                         edited = _reevaluate(edited)
                         _commit_candidate(i, edited, ck, run_id)
+                        _toast(f"Saved — {cand.get('full_name','')}", "💾")
                         st.rerun()
                     except ValueError:
                         st.error("Scores must be numbers.")
@@ -1683,6 +1748,7 @@ def main():
             st.session_state.page = "settings"
 
     _sync_results()
+    _show_toasts()
 
     # Follow a Part 2 this tab started through to the Final Review once it's done.
     snap = runner.snapshot()

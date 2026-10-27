@@ -137,6 +137,20 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(dec["decision"], "Pending", "the stale click must not approve new data")
         self.assertTrue(any("A new run replaced the results" in w.value for w in at.warning))
 
+    def test_unchanged_value_is_not_a_draft(self):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            import streamlit_app as app
+        self.assertTrue(app._same_value("9", 9.0))       # redrawn score after a save
+        self.assertTrue(app._same_value("", ""))
+        self.assertFalse(app._same_value("6", 9.0))
+        self.assertFalse(app._same_value("ok", ""))
+        at = _session("final_review")
+        box = self._pending_expander_text(at)[0]
+        box.input("typed").run()
+        self.assertTrue(store.load_drafts(store.load()["run_id"]))
+        box.input("").run()                              # put back the way it was
+        self.assertEqual(store.load_drafts(store.load()["run_id"]), {})
+
     def test_page_survives_a_refresh(self):
         at = _session("final_review")
         self.assertEqual(at.session_state["page"], "final_review")
@@ -158,23 +172,52 @@ class PersistenceTests(unittest.TestCase):
                     break
                 time.sleep(0.05)
 
-    def test_new_run_asks_before_replacing_unpushed_edits(self):
+    def test_new_run_asks_in_a_dialog_before_replacing_unpushed_edits(self):
         cand = store.load()["candidates"][0]
         store.update_candidate(cand)            # an edit that hasn't been pushed
         self.assertTrue(store.has_unpushed_edits())
         at = _session("control")
-        # The buttons need downloaded data to be enabled, so set the request
-        # the way a click on "Run Processor" would.
-        at.session_state["confirm_replace"] = "Part 2"
-        at.run()
+        at.button(key="btn_p1").click().run()   # Part 1 + auto Part 2 would replace results
         self.assertTrue(any("will replace the current Final Review results" in w.value
                             for w in at.warning))
+        self.assertFalse(runner.snapshot()["running"], "nothing starts before confirming")
         at.button(key="cr_no").click().run()
-        self.assertIsNone(at.session_state["confirm_replace"])
+        self.assertFalse(any("will replace" in w.value for w in at.warning), "Cancel closes it")
+        self.assertFalse(runner.snapshot()["running"])
 
         store.mark_pushed()
         self.assertFalse(store.has_unpushed_edits())
 
+    def test_push_asks_in_a_dialog_showing_what_will_happen(self):
+        at = _session("final_review")
+        # Resolve the pending candidate so the push isn't blocked.
+        self._pending_expander_text(at)[0].input("ok")
+        next(b for b in at.button if b.key and b.key.startswith("pa_")).click().run()
+        at.button(key="fr_push").click().run()
+        text = " ".join(m.value for m in at.markdown)
+        self.assertIn("of 2 fellow(s) will be updated in Manatal", text)
+        self.assertTrue(any("Test Mode" in w.value for w in list(at.warning) + list(at.error)))
+        self.assertFalse(runner.snapshot()["running"], "nothing is pushed before confirming")
+        at.button(key="pd_no").click().run()
+        self.assertFalse(runner.snapshot()["running"])
+
+    def test_replaced_results_banner_stays_until_dismissed(self):
+        at = _session("final_review")
+        results, integ = _evaluate()
+        store.save_new_run(results, integ, "Part 2")
+        at.run()
+        banner = lambda: any("A new run replaced the results" in w.value for w in at.warning)
+        self.assertTrue(banner())
+        at.run()                                  # any other interaction
+        self.assertTrue(banner(), "must not vanish on the next click")
+        at.button(key="stale_ok").click().run()
+        self.assertFalse(banner())
+
+    def test_actions_confirm_with_a_toast(self):
+        at = _session("final_review")
+        self._pending_expander_text(at)[0].input("looks fine").run()
+        next(b for b in at.button if b.key and b.key.startswith("pa_")).click().run()
+        self.assertTrue(any(t.value.startswith("Approved — Pat Pending") for t in at.toast))
 
 if __name__ == "__main__":
     unittest.main()
