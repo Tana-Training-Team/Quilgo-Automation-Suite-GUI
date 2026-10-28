@@ -114,10 +114,28 @@ All outputs survive container restarts through Docker volume mounts:
 | Host path | Container path | Contents |
 |-----------|---------------|----------|
 | `./Quilgo/` | `/app/Quilgo/` | Downloaded quiz CSVs |
-| `./downloads/` | `/app/downloads/` | Manatal cache, audit logs |
+| `./downloads/` | `/app/downloads/` | Manatal cache, audit logs, run logs, Final Review state (`downloads/state/`) |
 | `./gui_config.ini` | `/app/gui_config.ini` | Saved credentials |
 | `./test-results/` | `/app/test-results/` | Playwright failure traces |
 | `./playwright-report/` | `/app/playwright-report/` | Playwright HTML report |
+
+### Final Review state — nothing is lost on refresh
+
+The dashboard's results and every reviewer decision are saved to disk, not kept in the browser tab:
+
+- **Part 2 results** are saved by the task itself as soon as it finishes, even if nobody has the page open.
+- **Every Approve / Reject / Save** is written immediately.
+- **Text typed but not yet saved** (justifications, score edits, decision changes) is kept as a draft and marked *📝 unsaved draft*.
+- **Tasks keep running** if you leave the page or close the tab; every page and tab shows the same status and log. Only one task can run at a time.
+- Refreshing keeps you on the same page.
+- Starting a new Part 2 while reviewed edits haven't been pushed asks for confirmation first. The replaced run is kept in `downloads/state/results_prev.json`.
+
+| File (under `downloads/state/`) | Contents |
+|---|---|
+| `results.json` | Current run: candidates, decisions, timestamps of last edit / push |
+| `results_prev.json` | The run before it |
+| `integrity.json` | Integrity flags for the current run (used when re-evaluating) |
+| `drafts.json` | Unsaved dashboard input |
 
 ### Storage layout
 
